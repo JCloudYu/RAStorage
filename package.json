@@ -1,0 +1,23 @@
+{
+	"name": "rastorage",
+	"version": "0.1.0",
+	"description": "A randome access storage that can be used in simple databases.",
+	"main": "rastorage.js",
+	"scripts": {
+		"test": "echo \"Error: no test specified\" && exit 1"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/JCloudYu/RAStorage.git"
+	},
+	"keywords": [
+		"RandomAccess",
+		"RAStorage"
+	],
+	"author": "JCloudYu",
+	"license": "ISC",
+	"bugs": {
+		"url": "https://github.com/JCloudYu/RAStorage/issues"
+	},
+	"homepage": "https://github.com/JCloudYu/RAStorage#readme"
+}
