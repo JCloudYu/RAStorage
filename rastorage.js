@@ -24,7 +24,7 @@
 		
 		
 		
-		static initAtPath(path) {
+		static async initAtPath(path) {
 			return new RAStorage(path);
 		}
 	}
