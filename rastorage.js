@@ -22,6 +22,7 @@
 	const DATA_BODY_LENGTH 			= 255;
 	const DATA_ALL_LENGTH 			= DATA_ID_LENGTH + DATA_SPACE_LENGTH + DATA_BODY_LENGTH;
 
+
 	
 	class RAStorage {
 
@@ -33,10 +34,12 @@
 		async put(data) {
 			const {rastorage_fd, segd, segd_fd} = _RAStorage.get(this);
 			const original_pieces = ___SPLIT_DATA( data );
-			const pieces = [];
-
+			const pieces 	= [];
 			const removes 	= [];
 			const frags 	= segd.frags;
+
+
+			// INFO: Fill blocks
 			for( const fbId of frags ) {
 				const piece = original_pieces.shift();
 				if( !piece ) break;
@@ -53,6 +56,8 @@
 			}
 
 
+
+			// INFO: Write data
 			let prev_piece 	= pieces.shift();
 			let firstId 	= prev_piece.posId;
 			for( const piece of pieces ) {
@@ -63,6 +68,7 @@
 			await ___PROMISEFY( fs.write, fs, rastorage_fd, prev_piece.data, 0, prev_piece.data.length, (prev_piece.posId - 1) * DATA_ALL_LENGTH );
 
 
+
 			SEGD_TIMEOUT( ___UPDATE_SEGD.bind(null, segd_fd, segd), 0 );
 			return firstId;
 		}
@@ -71,21 +77,22 @@
 			await this.del( id );
 
 
+
 			const {rastorage_fd, segd, segd_fd} = _RAStorage.get(this);
 			const original_pieces = ___SPLIT_DATA( data );
-			const pieces = [];
-
-			let frags 	= segd.frags;
-			const piece = original_pieces.shift();
-			pieces.push( { posId: id, data: piece } );
+			const piece 	= original_pieces.shift();
+			let frags 		= segd.frags;
+			const pieces 	= [];
+			const removes 	= [];
 
 			// INFO: Use id as the first replaced block
-			const removes = [];
+			pieces.push( { posId: id, data: piece } );
 			removes.push( id );
 			segd.useless_block_amount--;
 			frags = frags.filter((fbId)=>{ return removes.indexOf(fbId) < 0; });
 
 
+			// INFO: Fill blocks
 			for( const fbId of frags ) {
 				const piece = original_pieces.shift();
 				if( !piece ) break;
@@ -102,6 +109,7 @@
 			}
 
 
+			// INFO: Write data
 			let prev_piece 	= pieces.shift();
 			for( const piece of pieces ) {
 				prev_piece.data.writeUInt32LE( piece.posId, 0 );
@@ -109,6 +117,8 @@
 				prev_piece = piece;
 			}
 			await ___PROMISEFY( fs.write, fs, rastorage_fd, prev_piece.data, 0, prev_piece.data.length, (prev_piece.posId - 1) * DATA_ALL_LENGTH );
+
+
 
 			SEGD_TIMEOUT( ___UPDATE_SEGD.bind(null, segd_fd, segd), 0 );
 			return id;
@@ -146,6 +156,7 @@
 			catch(e) {
 				throw new Error( `Cannot get data! (${e})` );
 			}
+
 
 
 			return result;
