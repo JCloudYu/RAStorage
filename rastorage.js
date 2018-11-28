@@ -13,6 +13,7 @@
 
 
 	const _RAStorage = new WeakMap();
+	let SEGD_TIMEOUT = ___UNIQUE_TIMEOUT();
 
 	const USELESS_SEGMENT_LENGTH 	= 4;
 	const DATA_ID_LENGTH 			= 4;
@@ -23,94 +24,167 @@
 
 	
 	class RAStorage {
+
 		constructor() {
 			const PROPS = {};
 			_RAStorage.set( this, PROPS );
 		}
+
 		async put(data) {
 			const {rastorage_fd, segd, segd_fd} = _RAStorage.get(this);
-
-			if( data instanceof ArrayBuffer )
-				data = Buffer.from( data );
-			if( !(data instanceof Buffer) ) throw new Error( `Data type should be Buffer or ArrayBuffer!` );
-
-
 			const original_pieces = ___SPLIT_DATA( data );
 			const pieces = [];
 
-			for( const fbId of segd.frags ) {
+			const removes 	= [];
+			const frags 	= segd.frags;
+			for( const fbId of frags ) {
 				const piece = original_pieces.shift();
 				if( !piece ) break;
 
+				segd.useless_block_amount--;
+				removes.push( fbId );
 				pieces.push( { posId: fbId, data: piece } );
 			}
+			segd.frags = frags.filter((fbId)=>{ return removes.indexOf(fbId) < 0; });
 
 			for( const piece of original_pieces ) {
-				pieces.push( { posId: segd.block_amount, data: piece } );
 				segd.block_amount ++;
+				pieces.push( { posId: segd.block_amount, data: piece } );
 			}
+
 
 			let prev_piece 	= pieces.shift();
 			let firstId 	= prev_piece.posId;
 			for( const piece of pieces ) {
 				prev_piece.data.writeUInt32LE( piece.posId, 0 );
-				await ___PROMISEFY( fs.write, fs, rastorage_fd, prev_piece.data, 0, prev_piece.data.length, prev_piece.posId * DATA_ALL_LENGTH );
-				prev_piece = pieces;
+				await ___PROMISEFY( fs.write, fs, rastorage_fd, prev_piece.data, 0, prev_piece.data.length, (prev_piece.posId - 1) * DATA_ALL_LENGTH );
+				prev_piece = piece;
 			}
-			await ___PROMISEFY( fs.write, fs, rastorage_fd, prev_piece.data, 0, prev_piece.data.length, prev_piece.posId * DATA_ALL_LENGTH );
-			// TODO: Update segd file
+			await ___PROMISEFY( fs.write, fs, rastorage_fd, prev_piece.data, 0, prev_piece.data.length, (prev_piece.posId - 1) * DATA_ALL_LENGTH );
 
+
+			SEGD_TIMEOUT( ___UPDATE_SEGD.bind(null, segd_fd, segd), 0 );
 			return firstId;
 		}
+
 		async overwrite(id, data) {
 			await this.del( id );
-			return await this.put( data );
+
+
+			const {rastorage_fd, segd, segd_fd} = _RAStorage.get(this);
+			const original_pieces = ___SPLIT_DATA( data );
+			const pieces = [];
+
+			let frags 	= segd.frags;
+			const piece = original_pieces.shift();
+			pieces.push( { posId: id, data: piece } );
+
+			// INFO: Use id as the first replaced block
+			const removes = [];
+			removes.push( id );
+			segd.useless_block_amount--;
+			frags = frags.filter((fbId)=>{ return removes.indexOf(fbId) < 0; });
+
+
+			for( const fbId of frags ) {
+				const piece = original_pieces.shift();
+				if( !piece ) break;
+
+				segd.useless_block_amount--;
+				removes.push( fbId );
+				pieces.push( { posId: fbId, data: piece } );
+			}
+			segd.frags = frags.filter((fbId)=>{ return removes.indexOf(fbId) < 0; });
+
+			for( const piece of original_pieces ) {
+				segd.block_amount++;
+				pieces.push( { posId: segd.block_amount, data: piece } );
+			}
+
+
+			let prev_piece 	= pieces.shift();
+			for( const piece of pieces ) {
+				prev_piece.data.writeUInt32LE( piece.posId, 0 );
+				await ___PROMISEFY( fs.write, fs, rastorage_fd, prev_piece.data, 0, prev_piece.data.length, (prev_piece.posId - 1) * DATA_ALL_LENGTH );
+				prev_piece = piece;
+			}
+			await ___PROMISEFY( fs.write, fs, rastorage_fd, prev_piece.data, 0, prev_piece.data.length, (prev_piece.posId - 1) * DATA_ALL_LENGTH );
+
+			SEGD_TIMEOUT( ___UPDATE_SEGD.bind(null, segd_fd, segd), 0 );
+			return id;
 		}
+
 		async get(id) {
-			const { rastorage_fd } = _RAStorage.get(this);
+			const { rastorage_fd, segd } = _RAStorage.get(this);
 			const buff = Buffer.alloc( DATA_ALL_LENGTH );
 			let nextId = null, result = undefined;
-			id -= 1;
+
+			if( id < 1 || id > segd.block_amount ) return result;
+
+
 
 			try {
-				await ___PROMISEFY( fs.read, fs, rastorage_fd, buff, 0, DATA_ALL_LENGTH, id * DATA_ALL_LENGTH );
-
+				await ___PROMISEFY( fs.read, fs, rastorage_fd, buff, 0, DATA_ALL_LENGTH, ( id - 1 ) * DATA_ALL_LENGTH );
 				nextId = buff.readUInt32LE( 0 );
 				const data_length = buff.readUInt8( DATA_ID_LENGTH );
 				if( !data_length ) return result;
 
-				result = Buffer.concat( [buff.slice( DATA_HEADER_LENGTH, DATA_ALL_LENGTH )] );
+				result = Buffer.concat( [buff.slice( DATA_HEADER_LENGTH, DATA_HEADER_LENGTH + data_length )] );
 
 				while( nextId ) {
-					await ___PROMISEFY( fs.read, fs, rastorage_fd, buff, 0, DATA_ALL_LENGTH, nextId * DATA_ALL_LENGTH );
-					result = Buffer.concat( [ result, buff.slice( DATA_HEADER_LENGTH, DATA_ALL_LENGTH ) ] );
+					await ___PROMISEFY( fs.read, fs, rastorage_fd, buff, 0, DATA_ALL_LENGTH, (nextId - 1)* DATA_ALL_LENGTH );
+					const data_length = buff.readUInt8( DATA_ID_LENGTH );
+					result = Buffer.concat( [ result, buff.slice( DATA_HEADER_LENGTH, DATA_HEADER_LENGTH + data_length ) ] );
 					nextId = buff.readUInt32LE( 0 );
 				}
 
-				result = result.buffer;
+
+				let target = Buffer.alloc(result.length);
+				result.copy( target );
+				result = target.buffer;
 			}
 			catch(e) {
 				throw new Error( `Cannot get data! (${e})` );
 			}
 
+
 			return result;
 		}
+
 		async del(id) {
 			const { rastorage_fd, segd, segd_fd } = _RAStorage.get(this);
-			const header = Buffer.alloc( DATA_HEADER_LENGTH );
+			if( id < 1 || id > segd.block_amount ) throw new Error( `Target block (${id}) is out of scope!` );
 
-			header.writeUInt32LE( 0, 0 );
-			header.writeUInt8( 0, DATA_ID_LENGTH );
 
+
+			const buff 			= Buffer.alloc( DATA_ALL_LENGTH );
+			const new_header 	= Buffer.alloc( DATA_HEADER_LENGTH );
+			new_header.writeUInt32LE( 0, 0 );
+			new_header.writeUInt8( 0, DATA_ID_LENGTH );
+
+			let nextId = id;
 			try {
-				await ___PROMISEFY( fs.write, fs, rastorage_fd, 0, header, 0, header.length, (id - 1)* DATA_ALL_LENGTH );
-				segd.useless_block_amount ++;
-				segd.frags.push( id );
-				// TODO: Update segd file ...
+				while( nextId ) {
+					await ___PROMISEFY( fs.read, fs, rastorage_fd, buff, 0, DATA_ALL_LENGTH, ( nextId - 1 ) * DATA_ALL_LENGTH );
+					let data_length = buff.readUInt8( DATA_ID_LENGTH );
+					if( !data_length ) break;
+
+					await ___PROMISEFY( fs.write, fs, rastorage_fd, new_header, 0, new_header.length, (nextId - 1) * DATA_ALL_LENGTH );
+
+					if( !segd.frags.includes( nextId ) ) {
+						segd.frags.push( nextId );
+						segd.useless_block_amount ++;
+					}
+					nextId = buff.readUInt32LE( 0 );
+				}
 			}
 			catch(e) {
 				throw new Error( `Cannot delete data! ${e}` );
 			}
+
+
+
+			SEGD_TIMEOUT( ___UPDATE_SEGD.bind(null, segd_fd, segd), 0 );
 		}
 		
 		
@@ -125,19 +199,27 @@
 
 			await ___CREATE_DIR( dir );
 
+			// region: [ Read SEGD ]
 			try {
 				[PROPS.segd_fd] = await ___PROMISEFY( fs.open, fs, PROPS.segd_path, "r+" );
+				PROPS.segd 		= await ___READ_SEGD( PROPS.segd_fd );
 			}
 			catch(e) {
 				try {
-					[PROPS.segd_fd] 	= await ___WRITE_USELESS_SEGD( PROPS.segd_path );
-					[PROPS.segd] 		= await ___READ_SEGD( PROPS.segd_fd );
+					[PROPS.segd_fd] = await ___WRITE_USELESS_SEGD( PROPS.segd_path );
+					PROPS.segd = {
+						block_amount: 			0,
+						useless_block_amount: 	0,
+						frags: 					[]
+					};
 				}
 				catch(e) {
 					throw new Error( `Cannot access useless segments! (${e})` );
 				}
 			}
+			// endregion
 
+			// region: [ Prepare Storage ]
 			try {
 				[PROPS.rastorage_fd] = await ___PROMISEFY( fs.open, fs, PROPS.rastorage_path, "r+" );
 			}
@@ -149,6 +231,7 @@
 					throw new Error( `Cannot access rastorage! (${PROPS.rastorage_path})` )
 				}
 			}
+			// endregion
 
 
 			return STORAGE;
@@ -157,6 +240,40 @@
 	
 	module.exports = RAStorage;
 
+
+
+	async function ___UPDATE_SEGD(segd_fd, segd) {
+		await ___PROMISEFY( fs.ftruncate, fs, segd_fd, (2 + segd.useless_block_amount) * USELESS_SEGMENT_LENGTH );
+
+
+
+		let header_total_block 	= Buffer.alloc( USELESS_SEGMENT_LENGTH );
+		let header_free_block 	= Buffer.alloc( USELESS_SEGMENT_LENGTH );
+		let segd_pos 			= 2 * USELESS_SEGMENT_LENGTH;
+
+		header_total_block.writeUInt32LE( segd.block_amount, 0 );
+		header_free_block.writeUInt32LE( segd.useless_block_amount, 0 );
+		const header = Buffer.concat( [ header_total_block, header_free_block ] );
+		await ___PROMISEFY( fs.write, fs, segd_fd, header, 0, header.length, 0 );
+
+		for( const fbId of segd.frags ) {
+			const buff = Buffer.alloc( USELESS_SEGMENT_LENGTH );
+			buff.writeUInt32LE( fbId, 0 );
+			await ___PROMISEFY( fs.write, fs, segd_fd, buff, 0, buff.length, segd_pos );
+			segd_pos += USELESS_SEGMENT_LENGTH;
+		}
+	}
+
+	function ___UNIQUE_TIMEOUT() {
+		let hTimeout = null;
+		return (...args)=>{
+			if ( hTimeout !== null ) {
+				try{ clearTimeout(hTimeout); } catch(e){}
+			}
+
+			return (hTimeout = setTimeout(...args));
+		};
+	}
 
 	function ___SPLIT_DATA(data) {
 		if( data instanceof ArrayBuffer )
@@ -213,6 +330,7 @@
 
 			frags.push( buff.readUInt32LE( 0 ) );
 			segd_pos += USELESS_SEGMENT_LENGTH;
+
 		}
 
 
@@ -231,10 +349,11 @@
 	}
 
 	async function ___WRITE_USELESS_SEGD(path) {
-		let segd = Buffer.alloc( USELESS_SEGMENT_LENGTH );
-		segd.writeUInt32LE( 0, 0 ); // How many blocks
-		segd.writeUInt32LE( 0, 4 ); // How many free blocks
-		await ___PROMISEFY( fs.writeFile, fs, path, segd );
+		let header_total_block 	= Buffer.alloc( USELESS_SEGMENT_LENGTH );
+		let header_free_block 	= Buffer.alloc( USELESS_SEGMENT_LENGTH );
+		header_total_block.writeUInt32LE( 0, 0 ); 	// How many blocks
+		header_free_block.writeUInt32LE( 0, 0 ); 	// How many free blocks
+		await ___PROMISEFY( fs.writeFile, fs, path, Buffer.concat( [ header_total_block, header_free_block ] ) );
 		return await ___PROMISEFY( fs.open, fs, path, "r+" );
 	}
 
