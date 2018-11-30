@@ -4,390 +4,840 @@
 **/
 (()=>{
 	"use strict";
-
-
-
-	const fs 	= require( 'fs' );
-	const path 	= require( 'path' );
-
-
-
-	const _RAStorage = new WeakMap();
-	let SEGD_TIMEOUT = ___UNIQUE_TIMEOUT();
-
-	const USELESS_SEGMENT_LENGTH 	= 4;
-	const DATA_ID_LENGTH 			= 4;
-	const DATA_SPACE_LENGTH 		= 1;
-	const DATA_HEADER_LENGTH 		= DATA_ID_LENGTH + DATA_SPACE_LENGTH;
-	const DATA_BODY_LENGTH 			= 255;
-	const DATA_ALL_LENGTH 			= DATA_ID_LENGTH + DATA_SPACE_LENGTH + DATA_BODY_LENGTH;
+	
+	const {promises:fs} = require( 'fs' );
+	const path = require( 'path' );
+	const ExtPromise = require( 'jsboost/native/ext-promise' );
 
 
 	
+	const DB_STATE = { OK: 0, CLOSING: 1, CLOSED: 2 };
+	const THROTTLE_OP_TYPE	 = {
+		GET:0, PUT:1, DEL:2, SET:3, CLOSE:4
+	};
+	
+	const BLOCK_INIT_ID_SIZE = 1;
+	const BLOCK_ID_SIZE		 = 4;
+	const BLOCK_LENGTH_SIZE	 = 1;
+	const BLOCK_CONTENT_SIZE = 255;
+	const BLOCK_HEADER_SIZE	 = BLOCK_INIT_ID_SIZE + BLOCK_ID_SIZE + BLOCK_LENGTH_SIZE;
+	const BLOCK_SIZE = BLOCK_HEADER_SIZE + BLOCK_CONTENT_SIZE;
+	const UNUSED_BLOCK = Buffer.alloc(BLOCK_SIZE);
+
+	const DEFAULT_SEGD_HEADER	= Buffer.from([0x00, 0x00, 0x00, 0x00]);
+	const SEGD_HEADER_SIZE		= DEFAULT_SEGD_HEADER.length;
+	const SEGD_ITEM_SIZE		= SEGD_HEADER_SIZE;
+	const DEFAULT_BLST_HEADER = Buffer.from([0x01, 0x00, 0x00, 0x00, 0x00]);
+	const BLST_HEADER_SIZE		= DEFAULT_BLST_HEADER.length;
+	
+	
+
+
+
+
+	
+	/**
+	 * @type {WeakMap<RAStorage, RAStoragePrivates>}
+	 * @private
+	**/
+	const _RAStorage = new WeakMap();
 	class RAStorage {
-
-		constructor() {
-			const PROPS = {};
-			_RAStorage.set( this, PROPS );
-		}
-
-		async put(data) {
-			const {rastorage_fd, segd, segd_fd} = _RAStorage.get(this);
-			const original_pieces = ___SPLIT_DATA( data );
-			const pieces 	= [];
-			const removes 	= [];
-			const frags 	= segd.frags;
-
-
-			// INFO: Fill blocks
-			for( const fbId of frags ) {
-				const piece = original_pieces.shift();
-				if( !piece ) break;
-
-				segd.useless_block_amount--;
-				removes.push( fbId );
-				pieces.push( { posId: fbId, data: piece } );
+		constructor(err=true) {
+			if ( err ) {
+				throw new ReferenceError( "RAStorage instance should be obtained bia RAStorage.initAtPath method!" );
 			}
-			segd.frags = frags.filter((fbId)=>{ return removes.indexOf(fbId) < 0; });
-
-			for( const piece of original_pieces ) {
-				segd.block_amount ++;
-				pieces.push( { posId: segd.block_amount, data: piece } );
-			}
-
-
-
-			// INFO: Write data
-			let prev_piece 	= pieces.shift();
-			let firstId 	= prev_piece.posId;
-			for( const piece of pieces ) {
-				prev_piece.data.writeUInt32LE( piece.posId, 0 );
-				await ___PROMISEFY( fs.write, fs, rastorage_fd, prev_piece.data, 0, prev_piece.data.length, (prev_piece.posId - 1) * DATA_ALL_LENGTH );
-				prev_piece = piece;
-			}
-			await ___PROMISEFY( fs.write, fs, rastorage_fd, prev_piece.data, 0, prev_piece.data.length, (prev_piece.posId - 1) * DATA_ALL_LENGTH );
-
-
-
-			SEGD_TIMEOUT( ___UPDATE_SEGD.bind(null, segd_fd, segd), 0 );
-			return firstId;
-		}
-
-		async overwrite(id, data) {
-			await this.del( id );
-
-
-
-			const {rastorage_fd, segd, segd_fd} = _RAStorage.get(this);
-			const original_pieces = ___SPLIT_DATA( data );
-			const piece 	= original_pieces.shift();
-			let frags 		= segd.frags;
-			const pieces 	= [];
-			const removes 	= [];
-
-			// INFO: Use id as the first replaced block
-			pieces.push( { posId: id, data: piece } );
-			removes.push( id );
-			segd.useless_block_amount--;
-			frags = frags.filter((fbId)=>{ return removes.indexOf(fbId) < 0; });
-
-
-			// INFO: Fill blocks
-			for( const fbId of frags ) {
-				const piece = original_pieces.shift();
-				if( !piece ) break;
-
-				segd.useless_block_amount--;
-				removes.push( fbId );
-				pieces.push( { posId: fbId, data: piece } );
-			}
-			segd.frags = frags.filter((fbId)=>{ return removes.indexOf(fbId) < 0; });
-
-			for( const piece of original_pieces ) {
-				segd.block_amount++;
-				pieces.push( { posId: segd.block_amount, data: piece } );
-			}
-
-
-			// INFO: Write data
-			let prev_piece 	= pieces.shift();
-			for( const piece of pieces ) {
-				prev_piece.data.writeUInt32LE( piece.posId, 0 );
-				await ___PROMISEFY( fs.write, fs, rastorage_fd, prev_piece.data, 0, prev_piece.data.length, (prev_piece.posId - 1) * DATA_ALL_LENGTH );
-				prev_piece = piece;
-			}
-			await ___PROMISEFY( fs.write, fs, rastorage_fd, prev_piece.data, 0, prev_piece.data.length, (prev_piece.posId - 1) * DATA_ALL_LENGTH );
-
-
-
-			SEGD_TIMEOUT( ___UPDATE_SEGD.bind(null, segd_fd, segd), 0 );
-			return id;
-		}
-
-		async get(id) {
-			const { rastorage_fd, segd } = _RAStorage.get(this);
-			const buff = Buffer.alloc( DATA_ALL_LENGTH );
-			let nextId = null, result = undefined;
-
-			if( id < 1 || id > segd.block_amount ) return result;
-
-
-
-			try {
-				await ___PROMISEFY( fs.read, fs, rastorage_fd, buff, 0, DATA_ALL_LENGTH, ( id - 1 ) * DATA_ALL_LENGTH );
-				nextId = buff.readUInt32LE( 0 );
-				const data_length = buff.readUInt8( DATA_ID_LENGTH );
-				if( !data_length ) return result;
-
-				result = Buffer.concat( [buff.slice( DATA_HEADER_LENGTH, DATA_HEADER_LENGTH + data_length )] );
-
-				while( nextId ) {
-					await ___PROMISEFY( fs.read, fs, rastorage_fd, buff, 0, DATA_ALL_LENGTH, (nextId - 1)* DATA_ALL_LENGTH );
-					const data_length = buff.readUInt8( DATA_ID_LENGTH );
-					result = Buffer.concat( [ result, buff.slice( DATA_HEADER_LENGTH, DATA_HEADER_LENGTH + data_length ) ] );
-					nextId = buff.readUInt32LE( 0 );
-				}
-
-
-				let target = Buffer.alloc(result.length);
-				result.copy( target );
-				result = target.buffer;
-			}
-			catch(e) {
-				throw new Error( `Cannot get data! (${e})` );
-			}
-
-
-
-			return result;
-		}
-
-		async del(id) {
-			const { rastorage_fd, segd, segd_fd } = _RAStorage.get(this);
-			if( id < 1 || id > segd.block_amount ) throw new Error( `Target block (${id}) is out of scope!` );
-
-
-
-			const buff 			= Buffer.alloc( DATA_ALL_LENGTH );
-			const new_header 	= Buffer.alloc( DATA_HEADER_LENGTH );
-			new_header.writeUInt32LE( 0, 0 );
-			new_header.writeUInt8( 0, DATA_ID_LENGTH );
-
-			let nextId = id;
-			try {
-				while( nextId ) {
-					await ___PROMISEFY( fs.read, fs, rastorage_fd, buff, 0, DATA_ALL_LENGTH, ( nextId - 1 ) * DATA_ALL_LENGTH );
-					let data_length = buff.readUInt8( DATA_ID_LENGTH );
-					if( !data_length ) break;
-
-					await ___PROMISEFY( fs.write, fs, rastorage_fd, new_header, 0, new_header.length, (nextId - 1) * DATA_ALL_LENGTH );
-
-					if( !segd.frags.includes( nextId ) ) {
-						segd.frags.push( nextId );
-						segd.useless_block_amount ++;
-					}
-					nextId = buff.readUInt32LE( 0 );
-				}
-			}
-			catch(e) {
-				throw new Error( `Cannot delete data! ${e}` );
-			}
-
-
-
-			SEGD_TIMEOUT( ___UPDATE_SEGD.bind(null, segd_fd, segd), 0 );
+			
+			/** @type {RAStoragePrivates} */
+			const PROPS = {
+				throttle_queue: [],
+				throttle_timeout: ___GEN_TIMEOUT(),
+				segment_list: [],
+				root: null,
+				total_blocks: 0,
+				blst_fd: null,
+				segd_fd: null,
+				state: DB_STATE.CLOSED,
+				is_dirty: false
+			};
+			_RAStorage.set(this, PROPS);
+			
+			
+			this._serializer = null;
+			this._deserializer = null;
 		}
 		
-		
-		
-		static async initAtPath(dir) {
-			const STORAGE_DIR 	= path.resolve( dir );
-			const STORAGE 		= new RAStorage();
-			const PROPS 		= _RAStorage.get( STORAGE );
-
-			PROPS.segd_path 		= `${STORAGE_DIR}/useless.segd`;
-			PROPS.rastorage_path 	= `${STORAGE_DIR}/rastorage.jlst`;
-
-			await ___CREATE_DIR( dir );
-
-			// region: [ Read SEGD ]
-			try {
-				[PROPS.segd_fd] = await ___PROMISEFY( fs.open, fs, PROPS.segd_path, "r+" );
-				PROPS.segd 		= await ___READ_SEGD( PROPS.segd_fd );
+		/**
+		 * Get data from db
+		 *
+		 * @async
+		 * @param {Number} id The block id to retrieve
+		 * @returns {Promise<*>}
+		**/
+		get(id) {
+			const {throttle_queue, throttle_timeout, state} = _RAStorage.get(this);
+			
+			if ( state !== DB_STATE.OK ) {
+				return Promise.reject(new Error("Database has been closed!"));
 			}
-			catch(e) {
-				try {
-					[PROPS.segd_fd] = await ___WRITE_USELESS_SEGD( PROPS.segd_path );
-					PROPS.segd = {
-						block_amount: 			0,
-						useless_block_amount: 	0,
-						frags: 					[]
-					};
+			else {
+				const promise = ___PROMISE();
+				throttle_queue.push({op:THROTTLE_OP_TYPE.GET, id, promise});
+				throttle_timeout(___THROTTLE_TIMEOUT, 0, this);
+				return promise.p;
+			}
+		}
+		
+		/**
+		 * Write data to db
+		 *
+		 * @async
+		 * @param {*} data
+		 * @returns {Promise<Number>}
+		**/
+		put(data) {
+			const {throttle_queue, throttle_timeout, state} = _RAStorage.get(this);
+		
+			if ( state !== DB_STATE.OK ) {
+				return Promise.reject(new Error("Database has been closed!"));
+			}
+			else {
+				data = this._serializer ? this._serializer(data) : data;
+				data = ___OBTAIN_BUFFER(data);
+				
+				const promise = ___PROMISE();
+				throttle_queue.push({op:THROTTLE_OP_TYPE.PUT, data, promise});
+				throttle_timeout(___THROTTLE_TIMEOUT, 0, this);
+				return promise.p;
+			}
+		}
+		
+		/**
+		 * Write data to db
+		 *
+		 * @async
+		 * @param {Number} id The block id to retrieve
+		 * @param {*} data
+		 * @returns {Promise}
+		**/
+		set(id, data) {
+			const {throttle_queue, throttle_timeout, state} = _RAStorage.get(this);
+		
+			if ( state !== DB_STATE.OK ) {
+				return Promise.reject(new Error("Database has been closed!"));
+			}
+			else {
+				data = this._serializer ? this._serializer(data) : data;
+				data = ___OBTAIN_BUFFER(data);
+				
+				const promise = ___PROMISE();
+				throttle_queue.push({op:THROTTLE_OP_TYPE.SET, id, data, promise});
+				throttle_timeout(___THROTTLE_TIMEOUT, 0, this);
+				return promise.p;
+			}
+		}
+		
+		/**
+		 * Remove data from db
+		 *
+		 * @async
+		 * @param {Number} id The block id to retrieve
+		 * @returns {Promise}
+		**/
+		del(id) {
+			const {throttle_queue, throttle_timeout, state} = _RAStorage.get(this);
+			
+			if ( state !== DB_STATE.OK ) {
+				return Promise.reject(new Error("Database has been closed!"));
+			}
+			else {
+				const promise = ___PROMISE();
+				throttle_queue.push({op:THROTTLE_OP_TYPE.DEL, id, promise});
+				throttle_timeout(___THROTTLE_TIMEOUT, 0, this);
+				
+				return promise.p;
+			}
+		}
+		
+		/**
+		 * Close database connection
+		 *
+		 * @async
+		 * @returns {Promise}
+		**/
+		close() {
+			const {throttle_queue, throttle_timeout, state} = _RAStorage.get(this);
+			
+			if ( state !== DB_STATE.OK ) {
+				if ( state === DB_STATE.CLOSING ) {
+					return Promise.reject(new Error("Database has been closed!"));
 				}
-				catch(e) {
-					throw new Error( `Cannot access useless segments! (${e})` );
+				else {
+					return Promise.resolve();
 				}
+			}
+			else {
+				const promise = ___PROMISE();
+				throttle_queue.push({op:THROTTLE_OP_TYPE.CLOSE, promise});
+				throttle_timeout(___THROTTLE_TIMEOUT, 0, this);
+				
+				return promise.p;
+			}
+		}
+		
+		/**
+		 * Initialize a database at storage
+		 *
+		 * @async
+		 * @param {String} storage_dir
+		 * @returns {Promise<RAStorage>}
+		**/
+		static async InitAtPath(storage_dir) {
+			const STORAGE_ROOT_PATH = path.resolve(storage_dir);
+			// region [ Check & create storage root path ]
+			let item_stat = await fs.stat(STORAGE_ROOT_PATH).catch((e)=>{
+				if ( e.code !== "ENOENT" ) {
+					return Promise.reject(e);
+				}
+				
+				return null;
+			});
+			if ( !item_stat ) {
+				await fs.mkdir(STORAGE_ROOT_PATH, {recursive:true});
+			}
+			else
+			if ( !item_stat.isDirectory() ) {
+				throw new Error( `Target directory ${storage_dir} is not a directory!` );
 			}
 			// endregion
-
-			// region: [ Prepare Storage ]
-			try {
-				[PROPS.rastorage_fd] = await ___PROMISEFY( fs.open, fs, PROPS.rastorage_path, "r+" );
+			
+			
+			
+			const SEGMENT_DESCRIPTOR_PATH = `${STORAGE_ROOT_PATH}/storage.segd`;
+			const STORAGE_DATA_CONTAINER = `${STORAGE_ROOT_PATH}/storage.blst`;
+			// region [ Check & create storage content ]
+			// Init segment descriptor
+			item_stat = await fs.stat(SEGMENT_DESCRIPTOR_PATH).catch((e)=>{
+				if ( e.code !== "ENOENT" ) {
+					return Promise.reject(e);
+				}
+				
+				return null;
+			});
+			if ( !item_stat ) {
+				await fs.writeFile(SEGMENT_DESCRIPTOR_PATH, DEFAULT_SEGD_HEADER);
 			}
-			catch(e) {
-				try {
-					[PROPS.rastorage_fd] = await ___OPEN_NEW_FILE( PROPS.rastorage_path );
+			else
+			if ( !item_stat.isFile() ) {
+				throw new Error( `${SEGMENT_DESCRIPTOR_PATH} is not a valid segd file!` );
+			}
+			
+			// Init content container
+			item_stat = await fs.stat(STORAGE_DATA_CONTAINER).catch((e)=>{
+				if ( e.code !== "ENOENT" ) {
+					return Promise.reject(e);
 				}
-				catch(e) {
-					throw new Error( `Cannot access rastorage! (${PROPS.rastorage_path})` )
-				}
+				
+				return null;
+			});
+			if ( !item_stat ) {
+				await fs.writeFile(STORAGE_DATA_CONTAINER, DEFAULT_BLST_HEADER);
+			}
+			else
+			if ( !item_stat.isFile() ) {
+				throw new Error( `${SEGMENT_DESCRIPTOR_PATH} is not a valid blst file!` );
 			}
 			// endregion
-
-
+			
+			
+			
+			const STORAGE  = new RAStorage(false);
+			const _PRIVATE = _RAStorage.get(STORAGE);
+			const DataBuffer = Buffer.alloc(4);
+			// region [ Load storage ]
+			_PRIVATE.root = STORAGE_ROOT_PATH;
+			const SEGD_FD = _PRIVATE.segd_fd = await fs.open(SEGMENT_DESCRIPTOR_PATH, 'r+');
+			const BLST_FD = _PRIVATE.blst_fd = await fs.open(STORAGE_DATA_CONTAINER,  'r+');
+			
+			// Read content container's block sizes
+			await BLST_FD.read(DataBuffer, 0, 4, 0);
+			_PRIVATE.total_blocks = DataBuffer.readUInt32LE(0);
+			
+			// Read segmentation descriptor size
+			await SEGD_FD.read(DataBuffer, 0, 4, 0);
+			let segments_remain = DataBuffer.readUInt32LE(0);
+			let fPointer = 4, segment_buffer = [];
+			while(segments_remain-->0) {
+				await SEGD_FD.read(DataBuffer, 0, 4, fPointer);
+				segment_buffer.push(DataBuffer.readUInt32LE(0));
+			}
+			_PRIVATE.segment_list = segment_buffer.sort(___SEGD_CMP);
+			// endregion
+			
+			
+			_PRIVATE.state = DB_STATE.OK;
 			return STORAGE;
 		}
 	}
+	module.exports = {RAStorage};
 	
-	module.exports = RAStorage;
-
-
-
-	async function ___UPDATE_SEGD(segd_fd, segd) {
-		await ___PROMISEFY( fs.ftruncate, fs, segd_fd, (2 + segd.useless_block_amount) * USELESS_SEGMENT_LENGTH );
-
-
-
-		let header_total_block 	= Buffer.alloc( USELESS_SEGMENT_LENGTH );
-		let header_free_block 	= Buffer.alloc( USELESS_SEGMENT_LENGTH );
-		let segd_pos 			= 2 * USELESS_SEGMENT_LENGTH;
-
-		header_total_block.writeUInt32LE( segd.block_amount, 0 );
-		header_free_block.writeUInt32LE( segd.useless_block_amount, 0 );
-		const header = Buffer.concat( [ header_total_block, header_free_block ] );
-		await ___PROMISEFY( fs.write, fs, segd_fd, header, 0, header.length, 0 );
-
-		for( const fbId of segd.frags ) {
-			const buff = Buffer.alloc( USELESS_SEGMENT_LENGTH );
-			buff.writeUInt32LE( fbId, 0 );
-			await ___PROMISEFY( fs.write, fs, segd_fd, buff, 0, buff.length, segd_pos );
-			segd_pos += USELESS_SEGMENT_LENGTH;
+	
+	
+	
+	
+	/**
+	 * @param {ArrayBuffer|Buffer|Uint32Array|Uint16Array|Uint8Array|Int8Array|Int32Array|Int16Array|Float32Array|Float64Array|DataView} data
+	 * @returns {Buffer}
+	 * @private
+	**/
+	function ___OBTAIN_BUFFER(data) {
+		if ( data instanceof ArrayBuffer ) {
+			return Buffer.from(data);
+		}
+		
+		if ( Buffer.isBuffer(data) ) {
+			return data;
+		}
+		
+		if ( ArrayBuffer.isView(data) ) {
+			return Buffer.from(data.buffer);
 		}
 	}
-
-	function ___UNIQUE_TIMEOUT() {
+	/**
+	 * @returns {StatePromise}
+	 * @private
+	**/
+	function ___PROMISE() {
+		/** @type Function */
+		let res, rej;
+		const promise = new Promise((_res, _rej)=>{res=_res; rej=_rej;});
+		return {p:promise, res, rej};
+	}
+	/**
+	 * @returns {function(function, number, ...[*])}
+	 * @private
+	**/
+	function ___GEN_TIMEOUT() {
+		let cb_buff	 = null;
 		let hTimeout = null;
-		return (...args)=>{
-			if ( hTimeout !== null ) {
-				try{ clearTimeout(hTimeout); } catch(e){}
+		return (cb, delay, ...args)=>{
+			cb_buff={cb, delay, args};
+			
+			if ( !hTimeout ) {
+				___DO_TIMEOUT();
 			}
-
-			return (hTimeout = setTimeout(...args));
 		};
-	}
-
-	function ___SPLIT_DATA(data) {
-		if( data instanceof ArrayBuffer )
-			data = Buffer.from( data );
-		if( !(data instanceof Buffer) ) throw new Error( `Data type should be Buffer or ArrayBuffer!` );
-
-		const result = [];
-		const split_number = Math.ceil( data.length / DATA_BODY_LENGTH );
-		let curPos = 0;
-		for( let i=0; i<split_number; i++ ) {
-			const slice_raw 	= data.slice( curPos, curPos + DATA_BODY_LENGTH );
-			const header_raw 	= ___FILL_DATA_HEADER( 0, slice_raw.length );
-
-			curPos += DATA_BODY_LENGTH;
-			result.push( Buffer.concat( [ header_raw, slice_raw ] ) );
+		
+		function ___DO_TIMEOUT() {
+			if ( !cb_buff ) return;
+			
+			const {cb:callback, delay:cb_delay, args:cb_args} = cb_buff;
+			cb_buff  = null;
+			hTimeout = setTimeout(()=>{
+				Promise.resolve(callback(...cb_args))
+				.then(()=>{
+					hTimeout = null;
+					___DO_TIMEOUT();
+				})
+				.catch((e)=>{
+					hTimeout = null; throw e;
+				});
+			}, cb_delay);
 		}
-
-		return result;
 	}
-
-	function ___FILL_DATA_HEADER( blockId, spaceLen ) {
-		blockId 	= blockId | 0;
-		spaceLen 	= spaceLen | 0;
-
-		const raw_id 	= Buffer.alloc( DATA_ID_LENGTH );
-		const raw_space = Buffer.alloc( DATA_SPACE_LENGTH );
-
-		raw_id.writeUInt32LE( blockId, 0 );
-		raw_space.writeUInt8( spaceLen, 0 );
-
-		return Buffer.concat( [ raw_id, raw_space ] );
+	/**
+	 * @param {Number} a
+	 * @param {Number} b
+	 * @returns {Number}
+	 * @private
+	**/
+	function ___SEGD_CMP(a, b) {
+		return (a>b?1:(a<b?-1:0));
 	}
-
-	async function ___READ_SEGD(segd_fd) {
-		let rLen, segd_pos = 0, buff = Buffer.alloc( USELESS_SEGMENT_LENGTH );
-
-		[rLen] = await ___PROMISEFY( fs.read, fs, segd_fd, buff, 0, USELESS_SEGMENT_LENGTH, segd_pos );
-		if( rLen !== USELESS_SEGMENT_LENGTH ) throw new Error( `Cannot read blocks amount information!` );
-		const block_amount = buff.readUInt32LE( 0 );
-		segd_pos += USELESS_SEGMENT_LENGTH;
-
-		[rLen] = await ___PROMISEFY( fs.read, fs, segd_fd, buff, 0, USELESS_SEGMENT_LENGTH, segd_pos );
-		if( rLen !== USELESS_SEGMENT_LENGTH ) throw new Error( `Cannot read useless blocks amount information!` );
-		const useless_block_amount = buff.readUInt32LE( 0 );
-		segd_pos += USELESS_SEGMENT_LENGTH;
-
-
-		const segd 	= {};
-		const frags = [];
-		while( segd_pos < ( useless_block_amount + 2 ) * USELESS_SEGMENT_LENGTH )
-		{
-			[rLen] = await ___PROMISEFY( fs.read, fs, segd_fd, buff, 0, USELESS_SEGMENT_LENGTH, segd_pos );
-			if( rLen !== USELESS_SEGMENT_LENGTH ) throw new Error( `Insufficient data in useless segmentation!` );
-
-			frags.push( buff.readUInt32LE( 0 ) );
-			segd_pos += USELESS_SEGMENT_LENGTH;
-
+	/**
+	 * @param {RAStorage} inst
+	 * @private
+	**/
+	async function ___THROTTLE_TIMEOUT(inst) {
+		const _PRIVATE = _RAStorage.get(inst);
+		const {throttle_queue, throttle_timeout} = _PRIVATE;
+		if ( throttle_queue.length <= 0 ) return;
+	
+		
+		
+		// Filter out the blocked operations from safe ops
+		const r_lock = [], w_lock = [], push_back = [], op_queue = [];
+		while( throttle_queue.length > 0 ) {
+			const operation = throttle_queue.shift();
+			if ( operation.op === THROTTLE_OP_TYPE.PUT ) {
+				op_queue.push(operation);
+			}
+			else
+			if ( operation.op === THROTTLE_OP_TYPE.GET ) {
+				if ( w_lock.indexOf(operation.id) >= 0 ) {
+					push_back.push(operation);
+				}
+				else {
+					r_lock.push(operation.id);
+					op_queue.push(operation);
+				}
+			}
+			else
+			if ( operation.op === THROTTLE_OP_TYPE.DEL ) {
+				if ( r_lock.indexOf(operation.id) >= 0 || w_lock.indexOf(operation.id) >= 0 ) {
+					push_back.push(operation);
+				}
+				else {
+					w_lock.push(operation.id);
+					op_queue.push(operation);
+				}
+			}
+			else
+			if ( operation.op === THROTTLE_OP_TYPE.SET ) {
+				if ( r_lock.indexOf(operation.id) >= 0 || w_lock.indexOf(operation.id) >= 0 ) {
+					push_back.push(operation);
+				}
+				else {
+					w_lock.push(operation.id);
+					op_queue.push(operation);
+				}
+			}
+			else
+			if ( operation.op === THROTTLE_OP_TYPE.CLOSE ) {
+				op_queue.push(operation);
+			}
 		}
-
-
-
-		segd.block_amount 			= block_amount;
-		segd.useless_block_amount 	= useless_block_amount;
-		segd.frags 					= frags;
-
-		return segd;
+		
+		// Push the blocked operations back into throttle queue
+		throttle_queue.splice(0, 0, ...push_back);
+		
+		// Process operations and make sure
+		const promises = [];
+		for( let operation of op_queue ) {
+			let promise;
+			switch(operation.op) {
+				case THROTTLE_OP_TYPE.GET:
+					promise = ___OPERATION_GET(inst, operation);
+					break;
+				case THROTTLE_OP_TYPE.PUT:
+					promise = ___OPERATION_PUT(inst, operation);
+					break;
+				case THROTTLE_OP_TYPE.SET:
+					promise = ___OPERATION_SET(inst, operation);
+					break;
+				case THROTTLE_OP_TYPE.DEL:
+					promise = ___OPERATION_DEL(inst, operation);
+					break;
+				case THROTTLE_OP_TYPE.CLOSE:
+					_PRIVATE.state = DB_STATE.CLOSING;
+					
+					if ( throttle_queue.length <= 0 && op_queue.length === 1 ) {
+						promise = ___OPERATION_CLOSE(inst, operation);
+					}
+					else {
+						throttle_queue.push(operation);
+					}
+					break;
+			}
+			
+			promises.push(promise);
+		}
+		
+		// Await for all the operations are done
+		await ExtPromise.WaitAll(promises).catch(ret=>ret);
+		
+		// Update total blocks and other segment list...
+		if ( _PRIVATE.is_dirty ) {
+			await ___DIRTY_WORK(inst);
+			_PRIVATE.is_dirty = false;
+		}
+		
+		
+		
+		// Keep resolving throttle if there still are operations in the throttle queue
+		if ( throttle_queue.length > 0 ) {
+			throttle_timeout(___THROTTLE_TIMEOUT, 0, inst);
+		}
 	}
-
-	async function ___OPEN_NEW_FILE(path) {
-		const [fd] = await ___PROMISEFY( fs.open, fs, path, "a+" );
-		await ___PROMISEFY( fs.close, fs, fd );
-		return await ___PROMISEFY( fs.open, fs, path, "r+" );
-	}
-
-	async function ___WRITE_USELESS_SEGD(path) {
-		let header_total_block 	= Buffer.alloc( USELESS_SEGMENT_LENGTH );
-		let header_free_block 	= Buffer.alloc( USELESS_SEGMENT_LENGTH );
-		header_total_block.writeUInt32LE( 0, 0 ); 	// How many blocks
-		header_free_block.writeUInt32LE( 0, 0 ); 	// How many free blocks
-		await ___PROMISEFY( fs.writeFile, fs, path, Buffer.concat( [ header_total_block, header_free_block ] ) );
-		return await ___PROMISEFY( fs.open, fs, path, "r+" );
-	}
-
-	async function ___CREATE_DIR(dir) {
+	
+	
+	
+	
+	/**
+	 * @param {RAStorage} inst
+	 * @param {RAStorageOperation} operation
+	 * @returns {Promise}
+	 * @private
+	**/
+	async function ___OPERATION_GET(inst, operation) {
+		const {id, promise} = operation;
+		
+		let data_buff = [], buff_size = 0;
 		try {
-			await ___PROMISEFY( fs.access, fs, dir );
+			// NOTE: Read initial block
+			let block = await ___READ_BLOCK(inst, id);
+			if ( !block.root ) {
+				promise.res(undefined);
+				return;
+			}
+			
+			// NOTE: Read all blocks
+			data_buff.push(block.content);
+			buff_size += block.contentLength;
+			while( block.next !== 0) {
+				block = await ___READ_BLOCK(inst, block.next);
+				data_buff.push(block.content);
+				buff_size += block.contentLength;
+			}
+			
+			// NOTE: Merge contents
+			const resultBuff = new Uint8Array(buff_size);
+			for(let i=0, anchor=0; i<data_buff.length; i++) {
+				const content = data_buff[i];
+				resultBuff.set(content, anchor);
+				anchor += content.byteLength;
+			}
+			
+			// NOTE: Resolve the original promise
+			promise.res(!inst._deserializer?resultBuff.buffer:inst._deserializer(resultBuff.buffer));
 		}
 		catch(e) {
-			try {
-				await ___PROMISEFY( fs.mkdir, fs, dir, { recursive: true } );
-			}
-			catch(e) {
-				throw new Error( `Cannot create the rastorage directory! (${e})` );
-			}
+			promise.rej(e);
+			throw e;
 		}
 	}
+	/**
+	 * @param {RAStorage} inst
+	 * @param {RAStorageOperation} operation
+	 * @returns {Promise}
+	 * @private
+	**/
+	async function ___OPERATION_PUT(inst, operation) {
+		const {data, promise} = operation;
+		const NUM_BLOCKS = (data.length <= 0) ? 1 : Math.ceil(data.length/BLOCK_CONTENT_SIZE);
+		const BLOCK_IDS	 = ___ALLOCATE_BLOCKS(inst, NUM_BLOCKS);
 
-	function ___PROMISEFY(func, thisArg=null, ...args) {
-		return new Promise((resolve, reject)=>{
-			func.call(thisArg, ...args, (err, ...results)=> {
-				if( err ) return reject(err);
-				resolve(results);
-			});
-		});
+		let anchor = 0, promises = [], initId = BLOCK_IDS[0];
+		while(BLOCK_IDS.length > 0) {
+			let blockId = BLOCK_IDS.shift();
+			let buff = data.slice(anchor, anchor + BLOCK_CONTENT_SIZE);
+			promises.push(___WRITE_BLOCK(inst, blockId, buff, BLOCK_IDS[0]||0, anchor===0));
+			anchor += buff.length;
+		}
+		
+		try {
+			await ExtPromise.WaitAll(promises);
+			promise.res(initId);
+		}
+		catch(e) {
+			let error = new Error( "Cannot put contents into blocks!" );
+			error.detail = [];
+			for( let result of e ) {
+				if (!result.resolved) {
+					error.detail.push(result.result);
+				}
+			}
+			
+			promise.rej(error);
+			throw error;
+		}
 	}
+	/**
+	 * @param {RAStorage} inst
+	 * @param {RAStorageOperation} operation
+	 * @returns {Promise}
+	 * @private
+	**/
+	async function ___OPERATION_SET(inst, operation) {
+		const {id, data, promise} = operation;
+		
+		
+		// NOTE: Read initial block
+		let remaining_blocks = (data.length <= 0) ? 1 : Math.ceil(data.length/BLOCK_CONTENT_SIZE);
+		let block = await ___READ_BLOCK(inst, id);
+		if ( !block.root ) {
+			const error = new RangeError(`Target file block #${id} is not an initial block!`);
+			promise.rej(error);
+			throw error;
+		}
+		
+		
+		let anchor = 0, blockId = id;
+		while(remaining_blocks>0 && block.next!==0) {
+			remaining_blocks--;
+			
+			let buff = data.slice(anchor, anchor+BLOCK_CONTENT_SIZE);
+			await ___WRITE_BLOCK(inst, blockId, buff, remaining_blocks === 0 ? 0 : block.next, anchor===0);
+			block = await ___READ_BLOCK(inst, blockId=block.next);
+			anchor += buff.length;
+		}
+		
+		if ( remaining_blocks > 0 ) {
+			if ( remaining_blocks === 1 ) {
+				let buff = data.slice(anchor, anchor+BLOCK_CONTENT_SIZE);
+				await ___WRITE_BLOCK(inst, blockId, buff, 0, anchor===0);
+				promise.res();
+			}
+			else {
+				const BLOCK_IDS = ___ALLOCATE_BLOCKS(inst, remaining_blocks - 1);
+				BLOCK_IDS.unshift(blockId);
+				
+				let promises = [];
+				while(BLOCK_IDS.length > 0) {
+					blockId = BLOCK_IDS.shift();
+					let buff = data.slice(anchor, anchor+BLOCK_CONTENT_SIZE);
+					promises.push(___WRITE_BLOCK(inst, blockId, buff, BLOCK_IDS[0]||0, anchor===0));
+					anchor += buff.length;
+				}
+				
+				try {
+					await ExtPromise.WaitAll(promises);
+					promise.res();
+				}
+				catch(e) {
+					let error = new Error( "Cannot put contents into blocks!" );
+					error.detail = [];
+					for( let result of e ) {
+						if (!result.resolved) {
+							error.detail.push(result.result);
+						}
+					}
+					promise.rej(error);
+					throw error;
+				}
+			}
+		}
+		else {
+			while(block.next!==0) {
+				await ___FREE_BLOCK(inst, blockId);
+				block = await ___READ_BLOCK(inst, blockId=block.next);
+			}
+			
+			await ___FREE_BLOCK(inst, blockId);
+			promise.res();
+		}
+	}
+	/**
+	 * @param {RAStorage} inst
+	 * @param {RAStorageOperation} operation
+	 * @returns {Promise}
+	 * @private
+	**/
+	async function ___OPERATION_DEL(inst, operation) {
+		const {id, promise} = operation;
+		
+		
+		let block = await ___READ_BLOCK(inst, id);
+		if ( !block.root ) {
+			const error = new RangeError(`Target file block #${id} is not an initial block!`);
+			promise.rej(error);
+			throw error;
+		}
+		
+		let blockId = id;
+		while(block.next!==0) {
+			await ___FREE_BLOCK(inst, blockId);
+			block = await ___READ_BLOCK(inst, blockId=block.next);
+		}
+		
+		await ___FREE_BLOCK(inst, blockId);
+		promise.res();
+	}
+	/**
+	 * @param {RAStorage} inst
+	 * @param {RAStorageOperation} operation
+	 * @returns {Promise}
+	 * @private
+	**/
+	async function ___OPERATION_CLOSE(inst, operation) {
+		const _PRIVATE = _RAStorage.get(inst);
+		const {promise} = operation;
+		
+		try {
+			await ExtPromise.WaitAll([_PRIVATE.blst_fd.close(), _PRIVATE.segd_fd.close()]);
+			_PRIVATE.state = DB_STATE.CLOSED;
+			promise.res();
+		}
+		catch(e) {
+			const error= new Error( "Cannot close database!" );
+			error.detail = [];
+			for(let res of e) {
+				if ( !res.resolved ) {
+					error.detail.push(res.result);
+				}
+			}
+			promise.rej(error);
+			throw error;
+		}
+	}
+	
+	
+	/**
+	 *
+	 * @async
+	 * @param {RAStorage} inst
+	 * @private
+	**/
+	async function ___DIRTY_WORK(inst) {
+		const {segd_fd, blst_fd, total_blocks, segment_list} = _RAStorage.get(inst);
+		
+		const blst_header = Buffer.alloc(BLST_HEADER_SIZE);
+		blst_header.writeUInt8(0x01, 0);
+		blst_header.writeUInt32LE(total_blocks, 1);
+		await blst_fd.write(blst_header, 0, BLST_HEADER_SIZE, 0);
+		
+		const segd_header = Buffer.alloc(SEGD_HEADER_SIZE);
+		segd_header.writeUInt32LE(segment_list.length, 0);
+		await segd_fd.write(segd_header, 0, SEGD_HEADER_SIZE, 0);
+		
+		const segd_item = Buffer.alloc(SEGD_ITEM_SIZE);
+		for(let i=0; i<segment_list.length; i++) {
+			segd_item.writeUInt32LE(segment_list[i], 0);
+			await segd_fd.write(segd_item, 0, SEGD_ITEM_SIZE, SEGD_HEADER_SIZE + i*SEGD_ITEM_SIZE);
+		}
+	}
+	/**
+	 * @async
+	 * @param {RAStorage} inst
+	 * @param {Number} blockId
+	 * @returns DataBlock
+	 * @private
+	**/
+	async function ___READ_BLOCK(inst, blockId) {
+		const {total_blocks, blst_fd} = _RAStorage.get(inst);
+		if ( blockId <= 0 || blockId >= total_blocks ) {
+			throw new RangeError( `Requested block #${blockId} is out of range!` );
+		}
+		
+		let buff = Buffer.alloc(BLOCK_SIZE);
+		await blst_fd.read(buff, 0, BLOCK_SIZE, BLST_HEADER_SIZE + (blockId-1)*BLOCK_SIZE);
+		
+		let
+		root = buff[0],
+		next = buff.readUInt32LE(1),
+		contentLength = buff.readUInt8(5),
+		content = buff.slice(6, 6+contentLength);
+		
+		
+		
+		return { root, next, contentLength, content };
+	}
+	/**
+	 * @async
+	 * @param {RAStorage} inst
+	 * @param {Number} blockId
+	 * @param {Buffer} content
+	 * @param {Number} [next=0]
+	 * @param {Boolean} [is_root=false]
+	 * @private
+	**/
+	async function ___WRITE_BLOCK(inst, blockId, content, next=0, is_root=false) {
+		const {blst_fd} = _RAStorage.get(inst);
+		if ( blockId <= 0 ) {
+			throw new RangeError( `Requested block #${blockId} is out of range!` );
+		}
+		
+		if ( content.length > 255 ) {
+			throw new RangeError( `Block content size should not be larger than 255!` );
+		}
+		
+		
+		
+		let buff = Buffer.alloc(BLOCK_SIZE);
+		buff.writeUInt8(is_root?0xFF:0x00, 0);
+		buff.writeUInt32LE(next, 1);
+		buff.writeUInt8(content.length, 5);
+		content.copy(buff, 6);
+		
+		await blst_fd.write(buff, 0, BLOCK_SIZE, BLST_HEADER_SIZE + (blockId-1)*BLOCK_SIZE);
+	}
+	/**
+	 * @async
+	 * @param {RAStorage} inst
+	 * @param {Number} blockId
+	 * @private
+	**/
+	async function ___FREE_BLOCK(inst, blockId) {
+		const _PRIVATE = _RAStorage.get(inst);
+		const {blst_fd, segment_list} = _PRIVATE;
+		if ( blockId <= 0 ) {
+			throw new RangeError( `Requested block #${blockId} is out of range!` );
+		}
+		
+		await blst_fd.write(UNUSED_BLOCK, 0, BLOCK_SIZE, BLST_HEADER_SIZE + (blockId-1)*BLOCK_SIZE);
+		segment_list.push(blockId);
+		_PRIVATE.is_dirty = _PRIVATE.is_dirty || true;
+	}
+	/**
+	 * @param {RAStorage} inst
+	 * @param {Number} num_blocks
+	 * @returns {Number[]}
+	 * @private
+	**/
+	function ___ALLOCATE_BLOCKS(inst, num_blocks) {
+		const _PRIVATE = _RAStorage.get(inst);
+		const {segment_list} = _PRIVATE;
+		
+		let remaining_segments = segment_list.sort(___SEGD_CMP);
+		let selected = remaining_segments.splice(0, num_blocks);
+		_PRIVATE.segment_list = remaining_segments;
+		
+		
+		
+		let num_create = num_blocks - selected.length;
+		for(let i=0; i<num_create; i++) {
+			selected.push(++_PRIVATE.total_blocks);
+		}
+		if ( num_create > 0 ) {
+			_PRIVATE.is_dirty = _PRIVATE.is_dirty || true;
+		}
+		
+		return selected;
+	}
+	
+	
+	
+	
+	
+	
+	// region [ Virtual class Definitions for JSDoc ]
+	/**
+	 * @class StatePromise
+	 * @property {Promise} StatePromise.p
+	 * @property {Function} StatePromise.res
+	 * @property {Function} StatePromise.rej
+	 * @private
+	**/
+	
+	/**
+	 * @class RAStoragePrivates
+	 * @property {Array} RAStoragePrivates.throttle_queue
+	 * @property {function(Function, Number, ...[*])} RAStoragePrivates.throttle_timeout
+	 * @property {Number[]} RAStoragePrivates.segment_list
+	 * @property {String|null} RAStoragePrivates.root
+	 * @property {Number} RAStoragePrivates.total_blocks
+	 * @property {*} RAStoragePrivates.blst_fd
+	 * @property {*} RAStoragePrivates.segd_fd
+	 * @property {Number} RAStoragePrivates.state
+	 * @property {Boolean} RAStoragePrivates.is_dirty
+	 * @private
+	**/
+	
+	/**
+	 * @class RAStorageOperation
+	 * @property {Number} RStorageOperation.op
+	 * @property {Number} [RStorageOperation.id]
+	 * @property {Buffer} [RStorageOperation.data]
+	 * @property {StatePromise} RStorageOperation.promise
+	 * @private
+	**/
+	
+	/**
+	 * @class DataBlock
+	 * @property {Number} DataBlock.root
+	 * @property {Number} DataBlock.next
+	 * @property {Number} DataBlock.contentLength
+	 * @property {Uint8Array|null} DataBlock.content
+	 * @private
+	**/
+	// endregion
 })();

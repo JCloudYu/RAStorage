@@ -1,7 +1,10 @@
 {
 	"name": "rastorage",
-	"version": "0.1.0",
+	"version": "0.1.2",
 	"description": "A randome access storage that can be used in simple databases.",
+	"engines": {
+		"node": ">=11"
+	},
 	"main": "rastorage.js",
 	"scripts": {
 		"test": "echo \"Error: no test specified\" && exit 1"
@@ -19,5 +22,8 @@
 	"bugs": {
 		"url": "https://github.com/JCloudYu/RAStorage/issues"
 	},
-	"homepage": "https://github.com/JCloudYu/RAStorage#readme"
+	"homepage": "https://github.com/JCloudYu/RAStorage#readme",
+	"dependencies": {
+		"jsboost": "^0.2.9"
+	}
 }
