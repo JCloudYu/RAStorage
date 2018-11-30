@@ -16,6 +16,7 @@
 		GET:0, PUT:1, DEL:2, SET:3, CLOSE:4
 	};
 	
+	const TRUNCATE_BOUNDARY	 = 1;
 	const BLOCK_INIT_ID_SIZE = 1;
 	const BLOCK_ID_SIZE		 = 4;
 	const BLOCK_LENGTH_SIZE	 = 1;
@@ -27,7 +28,7 @@
 	const DEFAULT_SEGD_HEADER	= Buffer.from([0x00, 0x00, 0x00, 0x00]);
 	const SEGD_HEADER_SIZE		= DEFAULT_SEGD_HEADER.length;
 	const SEGD_ITEM_SIZE		= SEGD_HEADER_SIZE;
-	const DEFAULT_BLST_HEADER = Buffer.from([0x01, 0x00, 0x00, 0x00, 0x00]);
+	const DEFAULT_BLST_HEADER	= Buffer.from([0x01, 0x00, 0x00, 0x00, 0x00]);
 	const BLST_HEADER_SIZE		= DEFAULT_BLST_HEADER.length;
 	
 	
@@ -49,6 +50,8 @@
 			
 			/** @type {RAStoragePrivates} */
 			const PROPS = {
+				version: 0,
+				keep_alive: setInterval(()=>{}, 86400000),
 				throttle_queue: [],
 				throttle_timeout: ___GEN_TIMEOUT(),
 				segment_list: [],
@@ -252,23 +255,25 @@
 			
 			const STORAGE  = new RAStorage(false);
 			const _PRIVATE = _RAStorage.get(STORAGE);
-			const DataBuffer = Buffer.alloc(4);
+			const DataBuffer = Buffer.alloc(Math.max(BLST_HEADER_SIZE, SEGD_HEADER_SIZE, SEGD_ITEM_SIZE));
 			// region [ Load storage ]
 			_PRIVATE.root = STORAGE_ROOT_PATH;
 			const SEGD_FD = _PRIVATE.segd_fd = await fs.open(SEGMENT_DESCRIPTOR_PATH, 'r+');
 			const BLST_FD = _PRIVATE.blst_fd = await fs.open(STORAGE_DATA_CONTAINER,  'r+');
 			
 			// Read content container's block sizes
-			await BLST_FD.read(DataBuffer, 0, 4, 0);
-			_PRIVATE.total_blocks = DataBuffer.readUInt32LE(0);
+			await BLST_FD.read(DataBuffer, 0, BLST_HEADER_SIZE, 0);
+			_PRIVATE.version = DataBuffer.readUInt8(0);
+			_PRIVATE.total_blocks = DataBuffer.readUInt32LE(1);
 			
 			// Read segmentation descriptor size
-			await SEGD_FD.read(DataBuffer, 0, 4, 0);
+			await SEGD_FD.read(DataBuffer, 0, SEGD_HEADER_SIZE, 0);
 			let segments_remain = DataBuffer.readUInt32LE(0);
-			let fPointer = 4, segment_buffer = [];
+			let fPointer = SEGD_HEADER_SIZE, segment_buffer = [];
 			while(segments_remain-->0) {
-				await SEGD_FD.read(DataBuffer, 0, 4, fPointer);
+				await SEGD_FD.read(DataBuffer, 0, SEGD_ITEM_SIZE, fPointer);
 				segment_buffer.push(DataBuffer.readUInt32LE(0));
+				fPointer += SEGD_ITEM_SIZE;
 			}
 			_PRIVATE.segment_list = segment_buffer.sort(___SEGD_CMP);
 			// endregion
@@ -411,27 +416,32 @@
 		throttle_queue.splice(0, 0, ...push_back);
 		
 		// Process operations and make sure
-		const promises = [];
+		const promises = [], op_map = [];
 		for( let operation of op_queue ) {
-			let promise;
+			let promise = null;
 			switch(operation.op) {
 				case THROTTLE_OP_TYPE.GET:
 					promise = ___OPERATION_GET(inst, operation);
+					op_map.push(operation);
 					break;
 				case THROTTLE_OP_TYPE.PUT:
 					promise = ___OPERATION_PUT(inst, operation);
+					op_map.push(operation);
 					break;
 				case THROTTLE_OP_TYPE.SET:
 					promise = ___OPERATION_SET(inst, operation);
+					op_map.push(operation);
 					break;
 				case THROTTLE_OP_TYPE.DEL:
 					promise = ___OPERATION_DEL(inst, operation);
+					op_map.push(operation);
 					break;
 				case THROTTLE_OP_TYPE.CLOSE:
 					_PRIVATE.state = DB_STATE.CLOSING;
 					
 					if ( throttle_queue.length <= 0 && op_queue.length === 1 ) {
 						promise = ___OPERATION_CLOSE(inst, operation);
+						op_map.push(operation);
 					}
 					else {
 						throttle_queue.push(operation);
@@ -439,11 +449,26 @@
 					break;
 			}
 			
-			promises.push(promise);
+			if ( promise ) {
+				promises.push(promise);
+			}
 		}
 		
-		// Await for all the operations are done
-		await ExtPromise.WaitAll(promises).catch(ret=>ret);
+		
+		
+		// Await for all the operations are done and respond operations' promises
+		const exec_results = await ExtPromise.WaitAll(promises).catch(ret=>ret);
+		for(let i=0; i<exec_results.length; i++) {
+			const status = exec_results[i];
+			if ( status.resolved ) {
+				op_map[i].promise.res(status.result);
+			}
+			else {
+				op_map[i].promise.rej(status.result);
+			}
+		}
+		
+		
 		
 		// Update total blocks and other segment list...
 		if ( _PRIVATE.is_dirty ) {
@@ -469,15 +494,14 @@
 	 * @private
 	**/
 	async function ___OPERATION_GET(inst, operation) {
-		const {id, promise} = operation;
+		const {id} = operation;
 		
 		let data_buff = [], buff_size = 0;
 		try {
 			// NOTE: Read initial block
 			let block = await ___READ_BLOCK(inst, id);
 			if ( !block.root ) {
-				promise.res(undefined);
-				return;
+				return undefined;
 			}
 			
 			// NOTE: Read all blocks
@@ -498,10 +522,9 @@
 			}
 			
 			// NOTE: Resolve the original promise
-			promise.res(!inst._deserializer?resultBuff.buffer:inst._deserializer(resultBuff.buffer));
+			return !inst._deserializer?resultBuff.buffer:inst._deserializer(resultBuff.buffer);
 		}
 		catch(e) {
-			promise.rej(e);
 			throw e;
 		}
 	}
@@ -512,7 +535,7 @@
 	 * @private
 	**/
 	async function ___OPERATION_PUT(inst, operation) {
-		const {data, promise} = operation;
+		const {data} = operation;
 		const NUM_BLOCKS = (data.length <= 0) ? 1 : Math.ceil(data.length/BLOCK_CONTENT_SIZE);
 		const BLOCK_IDS	 = ___ALLOCATE_BLOCKS(inst, NUM_BLOCKS);
 
@@ -526,7 +549,7 @@
 		
 		try {
 			await ExtPromise.WaitAll(promises);
-			promise.res(initId);
+			return initId;
 		}
 		catch(e) {
 			let error = new Error( "Cannot put contents into blocks!" );
@@ -537,7 +560,6 @@
 				}
 			}
 			
-			promise.rej(error);
 			throw error;
 		}
 	}
@@ -548,16 +570,14 @@
 	 * @private
 	**/
 	async function ___OPERATION_SET(inst, operation) {
-		const {id, data, promise} = operation;
+		const {id, data} = operation;
 		
 		
 		// NOTE: Read initial block
 		let remaining_blocks = (data.length <= 0) ? 1 : Math.ceil(data.length/BLOCK_CONTENT_SIZE);
 		let block = await ___READ_BLOCK(inst, id);
 		if ( !block.root ) {
-			const error = new RangeError(`Target file block #${id} is not an initial block!`);
-			promise.rej(error);
-			throw error;
+			throw new RangeError(`Target file block #${id} is not an initial block!`);
 		}
 		
 		
@@ -575,7 +595,7 @@
 			if ( remaining_blocks === 1 ) {
 				let buff = data.slice(anchor, anchor+BLOCK_CONTENT_SIZE);
 				await ___WRITE_BLOCK(inst, blockId, buff, 0, anchor===0);
-				promise.res();
+				return undefined;
 			}
 			else {
 				const BLOCK_IDS = ___ALLOCATE_BLOCKS(inst, remaining_blocks - 1);
@@ -591,7 +611,7 @@
 				
 				try {
 					await ExtPromise.WaitAll(promises);
-					promise.res();
+					return undefined;
 				}
 				catch(e) {
 					let error = new Error( "Cannot put contents into blocks!" );
@@ -601,7 +621,7 @@
 							error.detail.push(result.result);
 						}
 					}
-					promise.rej(error);
+					
 					throw error;
 				}
 			}
@@ -613,7 +633,7 @@
 			}
 			
 			await ___FREE_BLOCK(inst, blockId);
-			promise.res();
+			return undefined;
 		}
 	}
 	/**
@@ -623,14 +643,11 @@
 	 * @private
 	**/
 	async function ___OPERATION_DEL(inst, operation) {
-		const {id, promise} = operation;
-		
+		const {id} = operation;
 		
 		let block = await ___READ_BLOCK(inst, id);
 		if ( !block.root ) {
-			const error = new RangeError(`Target file block #${id} is not an initial block!`);
-			promise.rej(error);
-			throw error;
+			throw new RangeError(`Target file block #${id} is not an initial block!`);
 		}
 		
 		let blockId = id;
@@ -640,7 +657,7 @@
 		}
 		
 		await ___FREE_BLOCK(inst, blockId);
-		promise.res();
+		return undefined;
 	}
 	/**
 	 * @param {RAStorage} inst
@@ -650,12 +667,13 @@
 	**/
 	async function ___OPERATION_CLOSE(inst, operation) {
 		const _PRIVATE = _RAStorage.get(inst);
-		const {promise} = operation;
 		
 		try {
 			await ExtPromise.WaitAll([_PRIVATE.blst_fd.close(), _PRIVATE.segd_fd.close()]);
+			clearInterval(_PRIVATE.keep_alive);
 			_PRIVATE.state = DB_STATE.CLOSED;
-			promise.res();
+			_PRIVATE.keep_alive = null;
+			return undefined;
 		}
 		catch(e) {
 			const error= new Error( "Cannot close database!" );
@@ -665,7 +683,7 @@
 					error.detail.push(res.result);
 				}
 			}
-			promise.rej(error);
+			
 			throw error;
 		}
 	}
@@ -678,12 +696,38 @@
 	 * @private
 	**/
 	async function ___DIRTY_WORK(inst) {
-		const {segd_fd, blst_fd, total_blocks, segment_list} = _RAStorage.get(inst);
+		const _PRIVATE = _RAStorage.get(inst);
+		const {segd_fd, blst_fd, total_blocks, segment_list} = _PRIVATE;
+		
+		// NOTE: Do truncate if necessary
+		if ( segment_list.length > 0 ) {
+			const list = segment_list.slice().sort(___SEGD_CMP);
+			if ( list[list.length-1] === total_blocks ) {
+				let last = list.pop();
+				let truncate_pos = [last];
+				while( list.length>0 && list[list.length-1]===(last-1) ) {
+					truncate_pos.unshift(last=list.pop());
+				}
+				
+				if ( truncate_pos.length >= TRUNCATE_BOUNDARY ) {
+					await blst_fd.truncate(BLST_HEADER_SIZE + (truncate_pos[0]-1) * BLOCK_SIZE);
+					_PRIVATE.total_blocks -= truncate_pos.length;
+					segment_list.splice(0, segment_list.length, ...list);
+				}
+			}
+		}
+		
+		
+		
+		
 		
 		const blst_header = Buffer.alloc(BLST_HEADER_SIZE);
 		blst_header.writeUInt8(0x01, 0);
-		blst_header.writeUInt32LE(total_blocks, 1);
+		blst_header.writeUInt32LE(_PRIVATE.total_blocks, 1);
 		await blst_fd.write(blst_header, 0, BLST_HEADER_SIZE, 0);
+		
+		
+		
 		
 		const segd_header = Buffer.alloc(SEGD_HEADER_SIZE);
 		segd_header.writeUInt32LE(segment_list.length, 0);
@@ -704,7 +748,7 @@
 	**/
 	async function ___READ_BLOCK(inst, blockId) {
 		const {total_blocks, blst_fd} = _RAStorage.get(inst);
-		if ( blockId <= 0 || blockId >= total_blocks ) {
+		if ( blockId <= 0 || blockId > total_blocks ) {
 			throw new RangeError( `Requested block #${blockId} is out of range!` );
 		}
 		
@@ -758,8 +802,8 @@
 	**/
 	async function ___FREE_BLOCK(inst, blockId) {
 		const _PRIVATE = _RAStorage.get(inst);
-		const {blst_fd, segment_list} = _PRIVATE;
-		if ( blockId <= 0 ) {
+		const {blst_fd, segment_list, total_blocks} = _PRIVATE;
+		if ( blockId <= 0 || blockId > total_blocks ) {
 			throw new RangeError( `Requested block #${blockId} is out of range!` );
 		}
 		
