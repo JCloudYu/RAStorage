@@ -867,15 +867,15 @@
 	
 	/**
 	 * @class RAStoragePrivates
-	 * @property {Array} RAStoragePrivates.throttle_queue
-	 * @property {function(Function, Number, ...[*])} RAStoragePrivates.throttle_timeout
-	 * @property {Number[]} RAStoragePrivates.segment_list
-	 * @property {String|null} RAStoragePrivates.root
-	 * @property {Number} RAStoragePrivates.total_blocks
-	 * @property {*} RAStoragePrivates.blst_fd
-	 * @property {*} RAStoragePrivates.segd_fd
-	 * @property {Number} RAStoragePrivates.state
-	 * @property {Boolean} RAStoragePrivates.is_dirty
+	 * @property {Array}								RAStoragePrivates.throttle_queue
+	 * @property {function(Function, Number, ...[*])}	RAStoragePrivates.throttle_timeout
+	 * @property {Number[]}								RAStoragePrivates.segment_list
+	 * @property {String|null}							RAStoragePrivates.root
+	 * @property {Number}								RAStoragePrivates.total_blocks
+	 * @property {*}									RAStoragePrivates.blst_fd
+	 * @property {*}									RAStoragePrivates.segd_fd
+	 * @property {Number}								RAStoragePrivates.state
+	 * @property {Boolean}								RAStoragePrivates.is_dirty
 	 * @private
 	**/
 	
