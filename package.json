@@ -1,7 +1,7 @@
 {
 	"name": "rastorage",
 	"version": "0.9.0",
-	"description": "A randome access storage that can be used in simple databases.",
+	"description": "A random access storage that can be used in simple databases.",
 	"engines": {
 		"node": ">=11"
 	},

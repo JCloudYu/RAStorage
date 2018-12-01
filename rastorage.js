@@ -10,7 +10,7 @@
 	const ExtPromise = require( 'jsboost/native/ext-promise' );
 
 
-	
+	const LOCK_TYPE = { NONE:0, READ:1, WRITE:2, EXCLUSIVE:3 };
 	const DB_STATE = { OK: 0, CLOSING: 1, CLOSED: 2 };
 	const THROTTLE_OP_TYPE	 = {
 		GET:0, PUT:1, DEL:2, SET:3, CLOSE:4
@@ -168,11 +168,12 @@
 		 * @returns {Promise}
 		**/
 		close() {
-			const {throttle_queue, throttle_timeout, state} = _RAStorage.get(this);
+			const _PRIVATE = _RAStorage.get(this);
+			const {throttle_queue, throttle_timeout} = _PRIVATE;
 			
-			if ( state !== DB_STATE.OK ) {
-				if ( state === DB_STATE.CLOSING ) {
-					return Promise.reject(new Error("Database has been closed!"));
+			if ( _PRIVATE.state !== DB_STATE.OK ) {
+				if ( _PRIVATE.state === DB_STATE.CLOSING ) {
+					return Promise.reject(new Error( "Storage is closing now!" ));
 				}
 				else {
 					return Promise.resolve();
@@ -180,6 +181,8 @@
 			}
 			else {
 				const promise = ___PROMISE();
+				_PRIVATE.state = DB_STATE.CLOSING;
+				
 				throttle_queue.push({op:THROTTLE_OP_TYPE.CLOSE, promise});
 				throttle_timeout(___THROTTLE_TIMEOUT, 0, this);
 				
@@ -370,45 +373,41 @@
 		
 		
 		// Filter out the blocked operations from safe ops
-		const r_lock = [], w_lock = [], push_back = [], op_queue = [];
+		const locker = new Map();
+		const push_back = [], op_queue = [];
 		while( throttle_queue.length > 0 ) {
 			const operation = throttle_queue.shift();
 			if ( operation.op === THROTTLE_OP_TYPE.PUT ) {
 				op_queue.push(operation);
 			}
 			else
-			if ( operation.op === THROTTLE_OP_TYPE.GET ) {
-				if ( w_lock.indexOf(operation.id) >= 0 ) {
-					push_back.push(operation);
-				}
-				else {
-					r_lock.push(operation.id);
-					op_queue.push(operation);
-				}
-			}
-			else
-			if ( operation.op === THROTTLE_OP_TYPE.DEL ) {
-				if ( r_lock.indexOf(operation.id) >= 0 || w_lock.indexOf(operation.id) >= 0 ) {
-					push_back.push(operation);
-				}
-				else {
-					w_lock.push(operation.id);
-					op_queue.push(operation);
-				}
-			}
-			else
-			if ( operation.op === THROTTLE_OP_TYPE.SET ) {
-				if ( r_lock.indexOf(operation.id) >= 0 || w_lock.indexOf(operation.id) >= 0 ) {
-					push_back.push(operation);
-				}
-				else {
-					w_lock.push(operation.id);
-					op_queue.push(operation);
-				}
-			}
-			else
 			if ( operation.op === THROTTLE_OP_TYPE.CLOSE ) {
 				op_queue.push(operation);
+			}
+			else
+			if ( operation.op === THROTTLE_OP_TYPE.GET ) {
+				const lock = ___GET_LOCK(locker, operation.id);
+				if ( lock._t > LOCK_TYPE.READ ) {
+					push_back.push(operation);
+				}
+				else {
+					lock._t = LOCK_TYPE.READ;
+					op_queue.push(operation);
+				}
+			}
+			else
+			if ( operation.op === THROTTLE_OP_TYPE.DEL || operation.op === THROTTLE_OP_TYPE.SET ) {
+				const lock = ___GET_LOCK(locker, operation.id);
+				if ( lock._t !== LOCK_TYPE.NONE ) {
+					if ( lock._t === LOCK_TYPE.READ ) {
+						lock._t = LOCK_TYPE.EXCLUSIVE;
+					}
+					push_back.push(operation);
+				}
+				else {
+					lock._t = LOCK_TYPE.WRITE;
+					op_queue.push(operation);
+				}
 			}
 		}
 		
@@ -437,8 +436,6 @@
 					op_map.push(operation);
 					break;
 				case THROTTLE_OP_TYPE.CLOSE:
-					_PRIVATE.state = DB_STATE.CLOSING;
-					
 					if ( throttle_queue.length <= 0 && op_queue.length === 1 ) {
 						promise = ___OPERATION_CLOSE(inst, operation);
 						op_map.push(operation);
@@ -497,10 +494,11 @@
 		const {id} = operation;
 		
 		let data_buff = [], buff_size = 0;
+		
 		try {
 			// NOTE: Read initial block
-			let block = await ___READ_BLOCK(inst, id);
-			if ( !block.root ) {
+			let block = await ___READ_BLOCK(inst, id).catch(()=>{ return null; });
+			if ( !block || !block.root ) {
 				return undefined;
 			}
 			
@@ -836,6 +834,21 @@
 		}
 		
 		return selected;
+	}
+	/**
+	 * @param {Map<String, {_t:Number}>} locker
+	 * @param {Number} id
+	 * @returns {{_t:Number}}
+	 * @private
+	 */
+	function ___GET_LOCK(locker, id) {
+		const bId = `#${id}`;
+		let lock = locker.get(bId);
+		if ( !lock ) {
+			locker.set(bId, lock={_t:LOCK_TYPE.NONE});
+		}
+		
+		return lock;
 	}
 	
 	
