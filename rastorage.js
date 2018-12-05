@@ -30,6 +30,9 @@
 	const SEGD_ITEM_SIZE		= SEGD_HEADER_SIZE;
 	const DEFAULT_BLST_HEADER	= Buffer.from([0x01, 0x00, 0x00, 0x00, 0x00]);
 	const BLST_HEADER_SIZE		= DEFAULT_BLST_HEADER.length;
+
+	const CACHE_DATA_SIZE 		= 1000;
+	const CACHE_TOTAL_SIZE 		= 10000;
 	
 	
 
@@ -60,7 +63,8 @@
 				blst_fd: null,
 				segd_fd: null,
 				state: DB_STATE.CLOSED,
-				is_dirty: false
+				is_dirty: false,
+				cache: {}
 			};
 			_RAStorage.set(this, PROPS);
 			
@@ -491,10 +495,17 @@
 	 * @private
 	**/
 	async function ___OPERATION_GET(inst, operation) {
+		const _PRIVATE = _RAStorage.get(inst);
+		const {cache} = _PRIVATE;
 		const {id} = operation;
-		
+
+		// NOTE: Return cache data
+		if( cache[id] ) return cache[id].value;
+
+
+
 		let data_buff = [], buff_size = 0;
-		
+
 		try {
 			// NOTE: Read initial block
 			let block = await ___READ_BLOCK(inst, id).catch(()=>{ return null; });
@@ -520,7 +531,18 @@
 			}
 			
 			// NOTE: Resolve the original promise
-			return !inst._deserializer?resultBuff.buffer:inst._deserializer(resultBuff.buffer);
+			const resultArrayBuffer = resultBuff.buffer;
+			const value 			= !inst._deserializer?resultArrayBuffer:inst._deserializer(resultArrayBuffer);
+			const resultSize 		= resultArrayBuffer.byteLength;
+
+			// NOTE: Add data to cache
+			if( resultSize < CACHE_DATA_SIZE ) {
+				___REMOVE_OLD_CACHE( cache, resultSize );
+				cache[id] = { value, createTime: Date.now(), size: resultSize };
+			}
+
+
+			return value;
 		}
 		catch(e) {
 			throw e;
@@ -568,9 +590,13 @@
 	 * @private
 	**/
 	async function ___OPERATION_SET(inst, operation) {
+		const _PRIVATE = _RAStorage.get(inst);
 		const {id, data} = operation;
 		
-		
+
+		// NOTE: Remove cache data
+		delete _PRIVATE.cache[id];
+
 		// NOTE: Read initial block
 		let remaining_blocks = (data.length <= 0) ? 1 : Math.ceil(data.length/BLOCK_CONTENT_SIZE);
 		let block = await ___READ_BLOCK(inst, id);
@@ -641,8 +667,12 @@
 	 * @private
 	**/
 	async function ___OPERATION_DEL(inst, operation) {
+		const _PRIVATE = _RAStorage.get(inst);
 		const {id} = operation;
-		
+
+		// NOTE: Remove cache data
+		delete _PRIVATE.cache[id];
+
 		let block = await ___READ_BLOCK(inst, id);
 		if ( !block.root ) {
 			throw new RangeError(`Target file block #${id} is not an initial block!`);
@@ -850,7 +880,36 @@
 		
 		return lock;
 	}
-	
+
+	/**
+	 * @param cache
+	 * @param newDataSize
+	 * @private
+	 */
+	function ___REMOVE_OLD_CACHE(cache, newDataSize) {
+		let oldestTime 	= Date.now();
+		let oldestId 	= null;
+		let oldestSize 	= 0;
+		let totalSize 	= 0;
+		for( const bId in cache ) {
+			if( !cache.hasOwnProperty( bId ) ) continue;
+
+			const data = cache[bId];
+			if( data.createTime < oldestTime ) {
+				oldestTime 	= data.createTime;
+				oldestId 	= bId;
+				oldestSize 	= data.size;
+			}
+			totalSize += data.size;
+		}
+
+		if( totalSize > CACHE_TOTAL_SIZE ) {
+			delete cache[oldestId];
+		}
+		if( totalSize - oldestSize + newDataSize > CACHE_TOTAL_SIZE ) {
+			___REMOVE_OLD_CACHE( cache );
+		}
+	}
 	
 	
 	
