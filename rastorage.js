@@ -499,7 +499,7 @@
 
 		// NOTE: Return cache data
 		const cache_data = ___GET_CACHE( inst, id );
-		if( cache_data ) return cache_data.value;
+		if( cache_data === undefined ) return cache_data;
 
 
 
@@ -585,16 +585,16 @@
 		const {id, data} = operation;
 		
 
-		// NOTE: Remove cache data
-		___DELETE_CACHE( inst, id );
-
 		// NOTE: Read initial block
 		let remaining_blocks = (data.length <= 0) ? 1 : Math.ceil(data.length/BLOCK_CONTENT_SIZE);
 		let block = await ___READ_BLOCK(inst, id);
 		if ( !block.root ) {
 			throw new RangeError(`Target file block #${id} is not an initial block!`);
 		}
-		
+
+		// NOTE: Remove cache data
+		___DELETE_CACHE( inst, id );
+
 		
 		let anchor = 0, blockId = id;
 		while(remaining_blocks>0 && block.next!==0) {
@@ -660,14 +660,16 @@
 	async function ___OPERATION_DEL(inst, operation) {
 		const {id} = operation;
 
-		// NOTE: Remove cache data
-		___DELETE_CACHE( inst, id );
-
 		let block = await ___READ_BLOCK(inst, id);
 		if ( !block.root ) {
 			throw new RangeError(`Target file block #${id} is not an initial block!`);
 		}
-		
+
+
+		// NOTE: Remove cache data
+		___DELETE_CACHE( inst, id );
+
+
 		let blockId = id;
 		while(block.next!==0) {
 			await ___FREE_BLOCK(inst, blockId);
@@ -880,7 +882,7 @@
 		const {cache: { info, list }} = _RAStorage.get(inst);
 		const index = list.findIndex((data)=>{ return data.id === id;});
 
-		if( index !== -1 ) {
+		if( index >= 0 ) {
 			const removed = list.splice( index, 1 ).pop();
 			info.total_size -= removed.size;
 		}
@@ -898,7 +900,7 @@
 
 		if( result ) {
 			const value = result.value.slice(0);
-			return { value: !inst._deserializer?value:inst._deserializer(value) };
+			return !inst._deserializer?value:inst._deserializer(value);
 		}
 
 		return undefined;
