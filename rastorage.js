@@ -64,7 +64,7 @@
 				segd_fd: null,
 				state: DB_STATE.CLOSED,
 				is_dirty: false,
-				cache: {}
+				cache: {info: {}, list: []}
 			};
 			_RAStorage.set(this, PROPS);
 			
@@ -495,12 +495,11 @@
 	 * @private
 	**/
 	async function ___OPERATION_GET(inst, operation) {
-		const _PRIVATE = _RAStorage.get(inst);
-		const {cache} = _PRIVATE;
 		const {id} = operation;
 
 		// NOTE: Return cache data
-		if( cache[id] ) return cache[id].value;
+		const cache_data = ___GET_CACHE( inst, id );
+		if( cache_data ) return cache_data.value;
 
 
 
@@ -532,17 +531,10 @@
 			
 			// NOTE: Resolve the original promise
 			const resultArrayBuffer = resultBuff.buffer;
-			const value 			= !inst._deserializer?resultArrayBuffer:inst._deserializer(resultArrayBuffer);
-			const resultSize 		= resultArrayBuffer.byteLength;
-
 			// NOTE: Add data to cache
-			if( resultSize < CACHE_DATA_SIZE ) {
-				___REMOVE_OLD_CACHE( cache, resultSize );
-				cache[id] = { value, createTime: Date.now(), size: resultSize };
-			}
+			___UPDATE_CACHE( inst, id, resultArrayBuffer );
 
-
-			return value;
+			return !inst._deserializer?resultArrayBuffer:inst._deserializer(resultArrayBuffer);
 		}
 		catch(e) {
 			throw e;
@@ -590,12 +582,11 @@
 	 * @private
 	**/
 	async function ___OPERATION_SET(inst, operation) {
-		const _PRIVATE = _RAStorage.get(inst);
 		const {id, data} = operation;
 		
 
 		// NOTE: Remove cache data
-		delete _PRIVATE.cache[id];
+		___DELETE_CACHE( inst, id );
 
 		// NOTE: Read initial block
 		let remaining_blocks = (data.length <= 0) ? 1 : Math.ceil(data.length/BLOCK_CONTENT_SIZE);
@@ -667,11 +658,10 @@
 	 * @private
 	**/
 	async function ___OPERATION_DEL(inst, operation) {
-		const _PRIVATE = _RAStorage.get(inst);
 		const {id} = operation;
 
 		// NOTE: Remove cache data
-		delete _PRIVATE.cache[id];
+		___DELETE_CACHE( inst, id );
 
 		let block = await ___READ_BLOCK(inst, id);
 		if ( !block.root ) {
@@ -882,39 +872,66 @@
 	}
 
 	/**
-	 * @param cache
-	 * @param newDataSize
+	 * @param inst
+	 * @param id
 	 * @private
 	 */
-	function ___REMOVE_OLD_CACHE(cache, newDataSize) {
-		let oldestTime 	= Date.now();
-		let oldestId 	= null;
-		let oldestSize 	= 0;
-		let totalSize 	= 0;
-		for( const bId in cache ) {
-			if( !cache.hasOwnProperty( bId ) ) continue;
+	function ___DELETE_CACHE( inst, id ) {
+		const {cache: { info, list }} = _RAStorage.get(inst);
+		const index = list.findIndex((data)=>{ return data.id === id;});
 
-			const data = cache[bId];
-			if( data.createTime < oldestTime ) {
-				oldestTime 	= data.createTime;
-				oldestId 	= bId;
-				oldestSize 	= data.size;
-			}
-			totalSize += data.size;
+		if( index !== -1 ) {
+			const removed = list.splice( index, 1 ).pop();
+			info.total_size -= removed.size;
+		}
+	}
+
+	/**
+	 * @param inst
+	 * @param id
+	 * @returns {*}
+	 * @private
+	 */
+	function ___GET_CACHE( inst, id ) {
+		const {cache: { list }} = _RAStorage.get(inst);
+		const result = list.find((data)=>{ return data.id === id; });
+
+		if( result ) {
+			const value = result.value.slice(0);
+			return { value: !inst._deserializer?value:inst._deserializer(value) };
 		}
 
-		if( totalSize > CACHE_TOTAL_SIZE ) {
-			delete cache[oldestId];
+		return undefined;
+	}
+
+	/**
+	 * @param inst
+	 * @param id
+	 * @param value
+	 * @private
+	 */
+	function ___UPDATE_CACHE( inst, id, value ) {
+		const {cache: {info, list}} = _RAStorage.get(inst);
+		info.total_size = info.total_size | 0;
+
+		___DELETE_CACHE( inst, id );
+
+		if( value.byteLength < CACHE_DATA_SIZE ) {
+			const size = value.byteLength;
+			list.push( { id, value: value.slice(0), size } );
+			info.total_size += size;
 		}
-		if( totalSize - oldestSize + newDataSize > CACHE_TOTAL_SIZE ) {
-			___REMOVE_OLD_CACHE( cache );
+
+
+		// NOTE: Remove old cache data
+		while( info.total_size > CACHE_TOTAL_SIZE ) {
+			const removed = list.shift();
+			info.total_size -= removed.size;
 		}
 	}
 	
-	
-	
-	
-	
+
+
 	// region [ Virtual class Definitions for JSDoc ]
 	/**
 	 * @class StatePromise
