@@ -31,6 +31,9 @@
 	const SEGD_ITEM_SIZE		= SEGD_HEADER_SIZE;
 	const DEFAULT_BLST_HEADER	= Buffer.from([0x01, 0x00, 0x00, 0x00, 0x00]);
 	const BLST_HEADER_SIZE		= DEFAULT_BLST_HEADER.length;
+
+	const CACHE_DATA_SIZE 		= 1000;
+	const CACHE_TOTAL_SIZE 		= 10000;
 	
 	
 
@@ -61,7 +64,8 @@
 				blst_fd: null,
 				segd_fd: null,
 				state: DB_STATE.CLOSED,
-				is_dirty: false
+				is_dirty: false,
+				cache: {info: {}, list: []}
 			};
 			_RAStorage.set(this, PROPS);
 			
@@ -461,9 +465,15 @@
 	**/
 	async function ___OPERATION_GET(inst, operation) {
 		const {id} = operation;
-		
+
+		// NOTE: Return cache data
+		const cache_data = ___GET_CACHE( inst, id );
+		if( cache_data === undefined ) return cache_data;
+
+
+
 		let data_buff = [], buff_size = 0;
-		
+
 		try {
 			// NOTE: Read initial block
 			let block = await ___READ_BLOCK(inst, id).catch(()=>{ return null; });
@@ -489,7 +499,11 @@
 			}
 			
 			// NOTE: Resolve the original promise
-			return !inst._deserializer?resultBuff.buffer:inst._deserializer(resultBuff.buffer);
+			const resultArrayBuffer = resultBuff.buffer;
+			// NOTE: Add data to cache
+			___UPDATE_CACHE( inst, id, resultArrayBuffer );
+
+			return !inst._deserializer?resultArrayBuffer:inst._deserializer(resultArrayBuffer);
 		}
 		catch(e) {
 			throw e;
@@ -539,14 +553,17 @@
 	async function ___OPERATION_SET(inst, operation) {
 		const {id, data} = operation;
 		
-		
+
 		// NOTE: Read initial block
 		let remaining_blocks = (data.length <= 0) ? 1 : Math.ceil(data.length/BLOCK_CONTENT_SIZE);
 		let block = await ___READ_BLOCK(inst, id);
 		if ( !block.root ) {
 			throw new RangeError(`Target file block #${id} is not an initial block!`);
 		}
-		
+
+		// NOTE: Remove cache data
+		___DELETE_CACHE( inst, id );
+
 		
 		let anchor = 0, blockId = id;
 		while(remaining_blocks>0 && block.next!==0) {
@@ -611,12 +628,17 @@
 	**/
 	async function ___OPERATION_DEL(inst, operation) {
 		const {id} = operation;
-		
+
 		let block = await ___READ_BLOCK(inst, id);
 		if ( !block.root ) {
 			throw new RangeError(`Target file block #${id} is not an initial block!`);
 		}
-		
+
+
+		// NOTE: Remove cache data
+		___DELETE_CACHE( inst, id );
+
+
 		let blockId = id;
 		while(block.next!==0) {
 			await ___FREE_BLOCK(inst, blockId);
@@ -819,12 +841,68 @@
 		
 		return lock;
 	}
+
+	/**
+	 * @param inst
+	 * @param id
+	 * @private
+	 */
+	function ___DELETE_CACHE( inst, id ) {
+		const {cache: { info, list }} = _RAStorage.get(inst);
+		const index = list.findIndex((data)=>{ return data.id === id;});
+
+		if( index >= 0 ) {
+			const removed = list.splice( index, 1 ).pop();
+			info.total_size -= removed.size;
+		}
+	}
+
+	/**
+	 * @param inst
+	 * @param id
+	 * @returns {*}
+	 * @private
+	 */
+	function ___GET_CACHE( inst, id ) {
+		const {cache: { list }} = _RAStorage.get(inst);
+		const result = list.find((data)=>{ return data.id === id; });
+
+		if( result ) {
+			const value = result.value.slice(0);
+			return !inst._deserializer?value:inst._deserializer(value);
+		}
+
+		return undefined;
+	}
+
+	/**
+	 * @param inst
+	 * @param id
+	 * @param value
+	 * @private
+	 */
+	function ___UPDATE_CACHE( inst, id, value ) {
+		const {cache: {info, list}} = _RAStorage.get(inst);
+		info.total_size = info.total_size | 0;
+
+		___DELETE_CACHE( inst, id );
+
+		if( value.byteLength < CACHE_DATA_SIZE ) {
+			const size = value.byteLength;
+			list.push( { id, value: value.slice(0), size } );
+			info.total_size += size;
+		}
+
+
+		// NOTE: Remove old cache data
+		while( info.total_size > CACHE_TOTAL_SIZE ) {
+			const removed = list.shift();
+			info.total_size -= removed.size;
+		}
+	}
 	
-	
-	
-	
-	
-	
+
+
 	// region [ Virtual class Definitions for JSDoc ]
 	/**
 	 * @class StatePromise
