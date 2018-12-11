@@ -8,6 +8,7 @@
 	const {promises:fs} = require( 'fs' );
 	const path = require( 'path' );
 	const ExtPromise = require( 'jsboost/native/ext-promise' );
+	const {SingletonTimeout} = require( 'jsboost/native/ext-timer' );
 
 
 	const LOCK_TYPE = { NONE:0, READ:1, WRITE:2, EXCLUSIVE:3 };
@@ -53,7 +54,7 @@
 				version: 0,
 				keep_alive: setInterval(()=>{}, 86400000),
 				throttle_queue: [],
-				throttle_timeout: ___GEN_TIMEOUT(),
+				throttle_timeout: SingletonTimeout(),
 				segment_list: [],
 				root: null,
 				total_blocks: 0,
@@ -319,38 +320,6 @@
 		let res, rej;
 		const promise = new Promise((_res, _rej)=>{res=_res; rej=_rej;});
 		return {p:promise, res, rej};
-	}
-	/**
-	 * @returns {function(function, number, ...[*])}
-	 * @private
-	**/
-	function ___GEN_TIMEOUT() {
-		let cb_buff	 = null;
-		let hTimeout = null;
-		return (cb, delay, ...args)=>{
-			cb_buff={cb, delay, args};
-			
-			if ( !hTimeout ) {
-				___DO_TIMEOUT();
-			}
-		};
-		
-		function ___DO_TIMEOUT() {
-			if ( !cb_buff ) return;
-			
-			const {cb:callback, delay:cb_delay, args:cb_args} = cb_buff;
-			cb_buff  = null;
-			hTimeout = setTimeout(()=>{
-				Promise.resolve(callback(...cb_args))
-				.then(()=>{
-					hTimeout = null;
-					___DO_TIMEOUT();
-				})
-				.catch((e)=>{
-					hTimeout = null; throw e;
-				});
-			}, cb_delay);
-		}
 	}
 	/**
 	 * @param {Number} a
