@@ -7,8 +7,7 @@
 	
 	const {promises:fs} = require( 'fs' );
 	const path = require( 'path' );
-	const ExtPromise = require( 'jsboost/native/ext-promise' );
-	const {SingletonTimeout} = require( 'jsboost/native/ext-timer' );
+	const {ThrottledQueue, PromiseWaitAll} = require( './lib' );
 
 
 	const LOCK_TYPE = { NONE:0, READ:1, WRITE:2, EXCLUSIVE:3 };
@@ -39,6 +38,7 @@
 
 	const DEFAULT_MAX_CACHE_DATA_SIZE 	= 2048;
 	const DEFAULT_MAX_CACHE_TOTAL_SIZE 	= 10240;
+	const DEFAULT_THROTTLE_BATCH_COUNT	= 100;
 	
 	
 
@@ -61,8 +61,7 @@
 			const PROPS = {
 				version: 0,
 				keep_alive: setInterval(()=>{}, 86400000),
-				throttle_queue: [],
-				throttle_timeout: SingletonTimeout(),
+				throttle_queue: ThrottledQueue.CreateQueueWithConsumer(___THROTTLE_TIMEOUT.bind(null, this)),
 				segment_list: [],
 				root: null,
 				total_blocks: 0,
@@ -78,6 +77,9 @@
 					total_size:0,
 					index:[],
 					value:[]
+				},
+				throttle: {
+					batch_count:DEFAULT_THROTTLE_BATCH_COUNT
 				}
 			};
 			_RAStorage.set(this, PROPS);
@@ -95,16 +97,13 @@
 		 * @returns {Promise<*>}
 		**/
 		get(id) {
-			const {throttle_queue, throttle_timeout, state} = _RAStorage.get(this);
+			const {throttle_queue, state} = _RAStorage.get(this);
 			
 			if ( state !== DB_STATE.OK ) {
 				return Promise.reject(new Error("Database has been closed!"));
 			}
 			else {
-				const promise = ___PROMISE();
-				throttle_queue.push({op:THROTTLE_OP_TYPE.GET, id, promise});
-				throttle_timeout(___THROTTLE_TIMEOUT, 0, this);
-				return promise.p;
+				return throttle_queue.push({op:THROTTLE_OP_TYPE.GET, id});
 			}
 		}
 		
@@ -116,7 +115,7 @@
 		 * @returns {Promise<Number>}
 		**/
 		put(data) {
-			const {throttle_queue, throttle_timeout, state} = _RAStorage.get(this);
+			const {throttle_queue, state} = _RAStorage.get(this);
 		
 			if ( state !== DB_STATE.OK ) {
 				return Promise.reject(new Error("Database has been closed!"));
@@ -125,10 +124,7 @@
 				data = this._serializer ? this._serializer(data) : data;
 				data = ___OBTAIN_BUFFER(data);
 				
-				const promise = ___PROMISE();
-				throttle_queue.push({op:THROTTLE_OP_TYPE.PUT, data, promise});
-				throttle_timeout(___THROTTLE_TIMEOUT, 0, this);
-				return promise.p;
+				return throttle_queue.push({op:THROTTLE_OP_TYPE.PUT, data});
 			}
 		}
 		
@@ -138,10 +134,11 @@
 		 * @async
 		 * @param {Number} id The block id to retrieve
 		 * @param {*} data
+		 * @param {Boolean} force_create
 		 * @returns {Promise}
 		**/
-		set(id, data) {
-			const {throttle_queue, throttle_timeout, state} = _RAStorage.get(this);
+		set(id, data, force_create=false) {
+			const {throttle_queue, state} = _RAStorage.get(this);
 		
 			if ( state !== DB_STATE.OK ) {
 				return Promise.reject(new Error("Database has been closed!"));
@@ -150,10 +147,7 @@
 				data = this._serializer ? this._serializer(data) : data;
 				data = ___OBTAIN_BUFFER(data);
 				
-				const promise = ___PROMISE();
-				throttle_queue.push({op:THROTTLE_OP_TYPE.SET, id, data, promise});
-				throttle_timeout(___THROTTLE_TIMEOUT, 0, this);
-				return promise.p;
+				return throttle_queue.push({op:THROTTLE_OP_TYPE.SET, id, data, force_create});
 			}
 		}
 		
@@ -165,17 +159,13 @@
 		 * @returns {Promise}
 		**/
 		del(id) {
-			const {throttle_queue, throttle_timeout, state} = _RAStorage.get(this);
+			const {throttle_queue, state} = _RAStorage.get(this);
 			
 			if ( state !== DB_STATE.OK ) {
 				return Promise.reject(new Error("Database has been closed!"));
 			}
 			else {
-				const promise = ___PROMISE();
-				throttle_queue.push({op:THROTTLE_OP_TYPE.DEL, id, promise});
-				throttle_timeout(___THROTTLE_TIMEOUT, 0, this);
-				
-				return promise.p;
+				return throttle_queue.push({op:THROTTLE_OP_TYPE.DEL, id});
 			}
 		}
 		
@@ -187,7 +177,7 @@
 		**/
 		close() {
 			const _PRIVATE = _RAStorage.get(this);
-			const {throttle_queue, throttle_timeout} = _PRIVATE;
+			const {throttle_queue} = _PRIVATE;
 			
 			if ( _PRIVATE.state !== DB_STATE.OK ) {
 				if ( _PRIVATE.state === DB_STATE.CLOSING ) {
@@ -198,13 +188,8 @@
 				}
 			}
 			else {
-				const promise = ___PROMISE();
 				_PRIVATE.state = DB_STATE.CLOSING;
-				
-				throttle_queue.push({op:THROTTLE_OP_TYPE.CLOSE, promise});
-				throttle_timeout(___THROTTLE_TIMEOUT, 0, this);
-				
-				return promise.p;
+				return throttle_queue.push({op:THROTTLE_OP_TYPE.CLOSE});
 			}
 		}
 		
@@ -217,13 +202,15 @@
 		 * @param {Boolean} [options.cache=true]
 		 * @param {Number} [options.cache_max_data=2048]
 		 * @param {Number} [options.cache_max=10240]
+		 * @param {Number} [options.throttle_batch_count=100]
 		 * @returns {Promise<RAStorage>}
 		**/
 		static async InitAtPath(storage_dir, options={}) {
 			const {
 				cache=true,
 				cache_max=DEFAULT_MAX_CACHE_TOTAL_SIZE,
-				cache_max_data=DEFAULT_MAX_CACHE_DATA_SIZE
+				cache_max_data=DEFAULT_MAX_CACHE_DATA_SIZE,
+				throttle_batch_count=DEFAULT_THROTTLE_BATCH_COUNT
 			} = options||{};
 		
 			const STORAGE_ROOT_PATH = path.resolve(storage_dir);
@@ -314,6 +301,7 @@
 			_PRIVATE.cache.enabled = !!cache;
 			_PRIVATE.cache.max_data_size  = cache_max_data;
 			_PRIVATE.cache.max_total_size = cache_max >= cache_max_data ? cache_max : cache_max_data;
+			_PRIVATE.throttle.batch_count = throttle_batch_count > 0 ? throttle_batch_count : DEFAULT_THROTTLE_BATCH_COUNT;
 			return STORAGE;
 		}
 	}
@@ -342,16 +330,6 @@
 		}
 	}
 	/**
-	 * @returns {StatePromise}
-	 * @private
-	**/
-	function ___PROMISE() {
-		/** @type Function */
-		let res, rej;
-		const promise = new Promise((_res, _rej)=>{res=_res; rej=_rej;});
-		return {p:promise, res, rej};
-	}
-	/**
 	 * @param {Number} a
 	 * @param {Number} b
 	 * @returns {Number}
@@ -362,41 +340,53 @@
 	}
 	/**
 	 * @param {RAStorage} inst
+	 * @param {*[]} queue
 	 * @private
 	**/
-	async function ___THROTTLE_TIMEOUT(inst) {
-		const _PRIVATE = _RAStorage.get(inst);
-		const {throttle_queue, throttle_timeout} = _PRIVATE;
-		if ( throttle_queue.length <= 0 ) return;
+	async function ___THROTTLE_TIMEOUT(inst, queue) {
+		const {throttle:{batch_count:THROTTLE_BATCH_OP_COUNT}} = _RAStorage.get(inst);
 	
+		if ( queue.length <= 0 ) return;
 		
 		
 		// Filter out the blocked operations from safe ops
 		const locker = new Map();
-		const push_back = [], op_queue = [];
-		while( throttle_queue.length > 0 ) {
-			const operation = throttle_queue.shift();
-			if ( operation.op === THROTTLE_OP_TYPE.PUT ) {
+		const push_back = [], op_queue = [], promises = [];
+		while( queue.length > 0 && op_queue.length <= THROTTLE_BATCH_OP_COUNT ) {
+			let promise = null;
+			const operation = queue.shift();
+			const {info} = operation;
+			
+			
+			if ( info.op === THROTTLE_OP_TYPE.PUT ) {
 				op_queue.push(operation);
+				promise = ___OPERATION_PUT(inst, info);
 			}
 			else
-			if ( operation.op === THROTTLE_OP_TYPE.CLOSE ) {
-				op_queue.push(operation);
+			if ( info.op === THROTTLE_OP_TYPE.CLOSE ) {
+				if ( queue.length > 0 || op_queue.length > 0 ) {
+					push_back.push(operation);
+				}
+				else {
+					op_queue.push(operation);
+					promise = ___OPERATION_CLOSE(inst, info);
+				}
 			}
 			else
-			if ( operation.op === THROTTLE_OP_TYPE.GET ) {
-				const lock = ___GET_LOCK(locker, operation.id);
+			if ( info.op === THROTTLE_OP_TYPE.GET ) {
+				const lock = ___GET_LOCK(locker, info.id);
 				if ( lock._t > LOCK_TYPE.READ ) {
 					push_back.push(operation);
 				}
 				else {
 					lock._t = LOCK_TYPE.READ;
 					op_queue.push(operation);
+					promise = ___OPERATION_GET(inst, info);
 				}
 			}
 			else
-			if ( operation.op === THROTTLE_OP_TYPE.DEL || operation.op === THROTTLE_OP_TYPE.SET ) {
-				const lock = ___GET_LOCK(locker, operation.id);
+			if ( info.op === THROTTLE_OP_TYPE.SET ) {
+				const lock = ___GET_LOCK(locker, info.id);
 				if ( lock._t !== LOCK_TYPE.NONE ) {
 					if ( lock._t === LOCK_TYPE.READ ) {
 						lock._t = LOCK_TYPE.EXCLUSIVE;
@@ -406,77 +396,51 @@
 				else {
 					lock._t = LOCK_TYPE.WRITE;
 					op_queue.push(operation);
+					promise = ___OPERATION_SET(inst, info);
 				}
 			}
-		}
-		
-		// Push the blocked operations back into throttle queue
-		throttle_queue.splice(0, 0, ...push_back);
-		
-		// Process operations and make sure
-		const promises = [], op_map = [];
-		for( let operation of op_queue ) {
-			let promise = null;
-			switch(operation.op) {
-				case THROTTLE_OP_TYPE.GET:
-					promise = ___OPERATION_GET(inst, operation);
-					op_map.push(operation);
-					break;
-				case THROTTLE_OP_TYPE.PUT:
-					promise = ___OPERATION_PUT(inst, operation);
-					op_map.push(operation);
-					break;
-				case THROTTLE_OP_TYPE.SET:
-					promise = ___OPERATION_SET(inst, operation);
-					op_map.push(operation);
-					break;
-				case THROTTLE_OP_TYPE.DEL:
-					promise = ___OPERATION_DEL(inst, operation);
-					op_map.push(operation);
-					break;
-				case THROTTLE_OP_TYPE.CLOSE:
-					if ( throttle_queue.length <= 0 && op_queue.length === 1 ) {
-						promise = ___OPERATION_CLOSE(inst, operation);
-						op_map.push(operation);
+			else
+			if ( info.op === THROTTLE_OP_TYPE.DEL ) {
+				const lock = ___GET_LOCK(locker, info.id);
+				if ( lock._t !== LOCK_TYPE.NONE ) {
+					if ( lock._t === LOCK_TYPE.READ ) {
+						lock._t = LOCK_TYPE.EXCLUSIVE;
 					}
-					else {
-						throttle_queue.push(operation);
-					}
-					break;
+					push_back.push(operation);
+				}
+				else {
+					lock._t = LOCK_TYPE.WRITE;
+					op_queue.push(operation);
+					promise = ___OPERATION_DEL(inst, info);
+				}
 			}
+			
+			
 			
 			if ( promise ) {
 				promises.push(promise);
 			}
 		}
 		
+		// Push the blocked operations back into throttle queue
+		queue.splice(0, 0, ...push_back);
+		
 		
 		
 		// Await for all the operations are done and respond operations' promises
-		const exec_results = await ExtPromise.WaitAll(promises).catch(ret=>ret);
-		for(let i=0; i<exec_results.length; i++) {
-			const status = exec_results[i];
-			if ( status.resolved ) {
-				op_map[i].promise.res(status.result);
-			}
-			else {
-				op_map[i].promise.rej(status.result);
-			}
-		}
-		
-		
+		const exec_results = await PromiseWaitAll(promises).catch(ret=>ret);
 		
 		// Update total blocks and other segment list...
+		const _PRIVATE = _RAStorage.get(inst);
 		if ( _PRIVATE.is_dirty ) {
 			await ___DIRTY_WORK(inst);
 			_PRIVATE.is_dirty = false;
 		}
 		
-		
-		
-		// Keep resolving throttle if there still are operations in the throttle queue
-		if ( throttle_queue.length > 0 ) {
-			throttle_timeout(___THROTTLE_TIMEOUT, 0, inst);
+		for(let i=0; i<exec_results.length; i++) {
+			const {resolve, reject} = op_queue[i].ctrl;
+			const status = exec_results[i];
+			(status.resolved?resolve:reject)(status.result);
 		}
 	}
 	
@@ -555,7 +519,7 @@
 		}
 		
 		try {
-			await ExtPromise.WaitAll(promises);
+			await PromiseWaitAll(promises);
 			return initId;
 		}
 		catch(e) {
@@ -577,13 +541,22 @@
 	 * @private
 	**/
 	async function ___OPERATION_SET(inst, operation) {
-		const {id, data} = operation;
+		const {id, data, force_create} = operation;
 		
 
 		// NOTE: Read initial block
 		let remaining_blocks = (data.length <= 0) ? 1 : Math.ceil(data.length/BLOCK_CONTENT_SIZE);
 		let block = await ___READ_BLOCK(inst, id);
-		if ( block && block.used && !block.root ) {
+		if ( block ) {
+			if (
+				(!force_create && !block.used) ||
+				(block.used && !block.root)
+			) {
+				throw new RangeError(`Target file block #${id} is not a leading block!`);
+			}
+		}
+		else
+		if ( !force_create ) {
 			throw new RangeError(`Target file block #${id} is not a leading block!`);
 		}
 
@@ -627,7 +600,7 @@
 				}
 				
 				try {
-					await ExtPromise.WaitAll(promises);
+					await PromiseWaitAll(promises);
 					return undefined;
 				}
 				catch(e) {
@@ -698,7 +671,7 @@
 		const _PRIVATE = _RAStorage.get(inst);
 		
 		try {
-			await ExtPromise.WaitAll([_PRIVATE.blst_fd.close(), _PRIVATE.segd_fd.close()]);
+			await PromiseWaitAll([_PRIVATE.blst_fd.close(), _PRIVATE.segd_fd.close()]);
 			clearInterval(_PRIVATE.keep_alive);
 			_PRIVATE.state = DB_STATE.CLOSED;
 			_PRIVATE.keep_alive = null;
@@ -989,8 +962,7 @@
 	
 	/**
 	 * @class RAStoragePrivates
-	 * @property {Array}								RAStoragePrivates.throttle_queue
-	 * @property {function(Function, Number, ...[*])}	RAStoragePrivates.throttle_timeout
+	 * @property {ThrottledQueue}						RAStoragePrivates.throttle_queue
 	 * @property {Number[]}								RAStoragePrivates.segment_list
 	 * @property {String|null}							RAStoragePrivates.root
 	 * @property {Number}								RAStoragePrivates.total_blocks

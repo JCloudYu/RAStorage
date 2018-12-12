@@ -23,7 +23,5 @@
 		"url": "https://github.com/JCloudYu/RAStorage/issues"
 	},
 	"homepage": "https://github.com/JCloudYu/RAStorage#readme",
-	"dependencies": {
-		"jsboost": "^0.3.1"
-	}
+	"dependencies": {}
 }
