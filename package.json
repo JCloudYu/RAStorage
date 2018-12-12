@@ -24,6 +24,6 @@
 	},
 	"homepage": "https://github.com/JCloudYu/RAStorage#readme",
 	"dependencies": {
-		"jsboost": "^0.3.0"
+		"jsboost": "^0.3.1"
 	}
 }

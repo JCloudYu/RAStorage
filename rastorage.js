@@ -12,19 +12,24 @@
 
 
 	const LOCK_TYPE = { NONE:0, READ:1, WRITE:2, EXCLUSIVE:3 };
-	const DB_STATE = { OK: 0, CLOSING: 1, CLOSED: 2 };
+	const DB_STATE	= { OK: 0, CLOSING: 1, CLOSED: 2 };
 	const THROTTLE_OP_TYPE	 = {
 		GET:0, PUT:1, DEL:2, SET:3, CLOSE:4
 	};
 	
-	const TRUNCATE_BOUNDARY	 = 1;
-	const BLOCK_INIT_ID_SIZE = 1;
+	const TRUNCATE_BOUNDARY	 = 10;
+	const BLOCK_ATTR_SIZE	 = 1;
 	const BLOCK_ID_SIZE		 = 4;
 	const BLOCK_LENGTH_SIZE	 = 1;
 	const BLOCK_CONTENT_SIZE = 255;
-	const BLOCK_HEADER_SIZE	 = BLOCK_INIT_ID_SIZE + BLOCK_ID_SIZE + BLOCK_LENGTH_SIZE;
+	const BLOCK_HEADER_SIZE	 = BLOCK_ATTR_SIZE + BLOCK_ID_SIZE + BLOCK_LENGTH_SIZE;
 	const BLOCK_SIZE = BLOCK_HEADER_SIZE + BLOCK_CONTENT_SIZE;
 	const UNUSED_BLOCK = Buffer.alloc(BLOCK_SIZE);
+	const MAX_BLOCK_RANGE = 0xFFFFFFFF;
+	const BLOCK_ATTR_MASK = {
+		ALLOCATED:0x80,
+		LEADING_BLOCK:0x40
+	};
 
 	const DEFAULT_SEGD_HEADER	= Buffer.from([0x00, 0x00, 0x00, 0x00]);
 	const SEGD_HEADER_SIZE		= DEFAULT_SEGD_HEADER.length;
@@ -32,8 +37,8 @@
 	const DEFAULT_BLST_HEADER	= Buffer.from([0x01, 0x00, 0x00, 0x00, 0x00]);
 	const BLST_HEADER_SIZE		= DEFAULT_BLST_HEADER.length;
 
-	const CACHE_DATA_SIZE 		= 1000;
-	const CACHE_TOTAL_SIZE 		= 10000;
+	const DEFAULT_MAX_CACHE_DATA_SIZE 	= 2048;
+	const DEFAULT_MAX_CACHE_TOTAL_SIZE 	= 10240;
 	
 	
 
@@ -65,7 +70,15 @@
 				segd_fd: null,
 				state: DB_STATE.CLOSED,
 				is_dirty: false,
-				cache: {info: {}, list: []}
+				
+				cache: {
+					enabled:true,
+					max_data_size:DEFAULT_MAX_CACHE_DATA_SIZE,
+					max_total_size:DEFAULT_MAX_CACHE_TOTAL_SIZE,
+					total_size:0,
+					index:[],
+					value:[]
+				}
 			};
 			_RAStorage.set(this, PROPS);
 			
@@ -200,9 +213,19 @@
 		 *
 		 * @async
 		 * @param {String} storage_dir
+		 * @param {Object} options
+		 * @param {Boolean} [options.cache=true]
+		 * @param {Number} [options.cache_max_data=2048]
+		 * @param {Number} [options.cache_max=10240]
 		 * @returns {Promise<RAStorage>}
 		**/
-		static async InitAtPath(storage_dir) {
+		static async InitAtPath(storage_dir, options={}) {
+			const {
+				cache=true,
+				cache_max=DEFAULT_MAX_CACHE_TOTAL_SIZE,
+				cache_max_data=DEFAULT_MAX_CACHE_DATA_SIZE
+			} = options||{};
+		
 			const STORAGE_ROOT_PATH = path.resolve(storage_dir);
 			// region [ Check & create storage root path ]
 			let item_stat = await fs.stat(STORAGE_ROOT_PATH).catch((e)=>{
@@ -288,6 +311,9 @@
 			
 			
 			_PRIVATE.state = DB_STATE.OK;
+			_PRIVATE.cache.enabled = !!cache;
+			_PRIVATE.cache.max_data_size  = cache_max_data;
+			_PRIVATE.cache.max_total_size = cache_max >= cache_max_data ? cache_max : cache_max_data;
 			return STORAGE;
 		}
 	}
@@ -468,7 +494,7 @@
 
 		// NOTE: Return cache data
 		const cache_data = ___GET_CACHE( inst, id );
-		if( cache_data === undefined ) return cache_data;
+		if( cache_data !== undefined ) return cache_data;
 
 
 
@@ -477,7 +503,7 @@
 		try {
 			// NOTE: Read initial block
 			let block = await ___READ_BLOCK(inst, id).catch(()=>{ return null; });
-			if ( !block || !block.root ) {
+			if ( !block || !block.used || !block.root ) {
 				return undefined;
 			}
 			
@@ -501,7 +527,7 @@
 			// NOTE: Resolve the original promise
 			const resultArrayBuffer = resultBuff.buffer;
 			// NOTE: Add data to cache
-			___UPDATE_CACHE( inst, id, resultArrayBuffer );
+			___UPDATE_CACHE( inst, id, resultArrayBuffer);
 
 			return !inst._deserializer?resultArrayBuffer:inst._deserializer(resultArrayBuffer);
 		}
@@ -524,7 +550,7 @@
 		while(BLOCK_IDS.length > 0) {
 			let blockId = BLOCK_IDS.shift();
 			let buff = data.slice(anchor, anchor + BLOCK_CONTENT_SIZE);
-			promises.push(___WRITE_BLOCK(inst, blockId, buff, BLOCK_IDS[0]||0, anchor===0));
+			promises.push(___WRITE_BLOCK(inst, blockId, buff, BLOCK_IDS[0]||0, {used:true, root:anchor===0}));
 			anchor += buff.length;
 		}
 		
@@ -557,12 +583,19 @@
 		// NOTE: Read initial block
 		let remaining_blocks = (data.length <= 0) ? 1 : Math.ceil(data.length/BLOCK_CONTENT_SIZE);
 		let block = await ___READ_BLOCK(inst, id);
-		if ( !block.root ) {
-			throw new RangeError(`Target file block #${id} is not an initial block!`);
+		if ( block && block.used && !block.root ) {
+			throw new RangeError(`Target file block #${id} is not a leading block!`);
 		}
 
 		// NOTE: Remove cache data
 		___DELETE_CACHE( inst, id );
+		
+		
+		// NOTE: If block is beyond total_blocks
+		if ( !block ) {
+			___OCCUPY_BLOCK(inst, id);
+			block = {next:0};
+		}
 
 		
 		let anchor = 0, blockId = id;
@@ -570,7 +603,7 @@
 			remaining_blocks--;
 			
 			let buff = data.slice(anchor, anchor+BLOCK_CONTENT_SIZE);
-			await ___WRITE_BLOCK(inst, blockId, buff, remaining_blocks === 0 ? 0 : block.next, anchor===0);
+			await ___WRITE_BLOCK(inst, blockId, buff, remaining_blocks === 0 ? 0 : block.next, {used:true, root:anchor===0});
 			block = await ___READ_BLOCK(inst, blockId=block.next);
 			anchor += buff.length;
 		}
@@ -578,7 +611,7 @@
 		if ( remaining_blocks > 0 ) {
 			if ( remaining_blocks === 1 ) {
 				let buff = data.slice(anchor, anchor+BLOCK_CONTENT_SIZE);
-				await ___WRITE_BLOCK(inst, blockId, buff, 0, anchor===0);
+				await ___WRITE_BLOCK(inst, blockId, buff, 0, {used:true, root:anchor===0});
 				return undefined;
 			}
 			else {
@@ -589,7 +622,7 @@
 				while(BLOCK_IDS.length > 0) {
 					blockId = BLOCK_IDS.shift();
 					let buff = data.slice(anchor, anchor+BLOCK_CONTENT_SIZE);
-					promises.push(___WRITE_BLOCK(inst, blockId, buff, BLOCK_IDS[0]||0, anchor===0));
+					promises.push(___WRITE_BLOCK(inst, blockId, buff, BLOCK_IDS[0]||0, {used:true, root:anchor===0}));
 					anchor += buff.length;
 				}
 				
@@ -630,8 +663,15 @@
 		const {id} = operation;
 
 		let block = await ___READ_BLOCK(inst, id);
+		// NOTE: Return if the block is being freed already
+		if ( !block || !block.used ) {
+			return undefined;
+		}
+		
+		
+		// NOTE: The block is not a leading block
 		if ( !block.root ) {
-			throw new RangeError(`Target file block #${id} is not an initial block!`);
+			throw new RangeError(`Target file block #${id} is not a leading block!`);
 		}
 
 
@@ -732,27 +772,34 @@
 	 * @async
 	 * @param {RAStorage} inst
 	 * @param {Number} blockId
-	 * @returns DataBlock
+	 * @returns {DataBlock|null}
 	 * @private
 	**/
 	async function ___READ_BLOCK(inst, blockId) {
 		const {total_blocks, blst_fd} = _RAStorage.get(inst);
-		if ( blockId <= 0 || blockId > total_blocks ) {
+		if ( blockId <= 0 || blockId > MAX_BLOCK_RANGE ) {
 			throw new RangeError( `Requested block #${blockId} is out of range!` );
 		}
+		
+		// NOTE: Null means that the block space is not allocated yet!
+		if ( blockId > total_blocks ) { return null; }
+		
+		
 		
 		let buff = Buffer.alloc(BLOCK_SIZE);
 		await blst_fd.read(buff, 0, BLOCK_SIZE, BLST_HEADER_SIZE + (blockId-1)*BLOCK_SIZE);
 		
 		let
-		root = buff[0],
+		attr = buff[0],
+		used = attr & BLOCK_ATTR_MASK.ALLOCATED,
+		root = attr & BLOCK_ATTR_MASK.LEADING_BLOCK,
 		next = buff.readUInt32LE(1),
 		contentLength = buff.readUInt8(5),
 		content = buff.slice(6, 6+contentLength);
 		
 		
 		
-		return { root, next, contentLength, content };
+		return { used, root, next, contentLength, content };
 	}
 	/**
 	 * @async
@@ -760,12 +807,12 @@
 	 * @param {Number} blockId
 	 * @param {Buffer} content
 	 * @param {Number} [next=0]
-	 * @param {Boolean} [is_root=false]
+	 * @param {{used:Boolean, root:Boolean}} [attr={used:true, root:false}]
 	 * @private
 	**/
-	async function ___WRITE_BLOCK(inst, blockId, content, next=0, is_root=false) {
+	async function ___WRITE_BLOCK(inst, blockId, content, next=0, attr={used:true, root:false}) {
 		const {blst_fd} = _RAStorage.get(inst);
-		if ( blockId <= 0 ) {
+		if ( blockId <= 0 || blockId > MAX_BLOCK_RANGE ) {
 			throw new RangeError( `Requested block #${blockId} is out of range!` );
 		}
 		
@@ -774,9 +821,11 @@
 		}
 		
 		
+		let block_attr = attr.used ? BLOCK_ATTR_MASK.ALLOCATED : 0;
+		block_attr = block_attr | (attr.root ? BLOCK_ATTR_MASK.LEADING_BLOCK : 0);
 		
 		let buff = Buffer.alloc(BLOCK_SIZE);
-		buff.writeUInt8(is_root?0xFF:0x00, 0);
+		buff.writeUInt8(block_attr, 0);
 		buff.writeUInt32LE(next, 1);
 		buff.writeUInt8(content.length, 5);
 		content.copy(buff, 6);
@@ -827,6 +876,25 @@
 		return selected;
 	}
 	/**
+	 * @param {RAStorage} inst
+	 * @param {Number} blockId
+	 * @private
+	 */
+	function ___OCCUPY_BLOCK(inst, blockId) {
+		const _PRIVATE = _RAStorage.get(inst);
+		const {total_blocks, segment_list} = _PRIVATE;
+		if ( blockId <= total_blocks ) return;
+		
+		_PRIVATE.total_blocks = blockId;
+		
+		// NOTE: Mark the blocks between old tail and latest block as unused
+		for( let i=total_blocks+1; i<blockId; i++ ) {
+			segment_list.push(i);
+		}
+		
+		_PRIVATE.is_dirty = _PRIVATE.is_dirty || true;
+	}
+	/**
 	 * @param {Map<String, {_t:Number}>} locker
 	 * @param {Number} id
 	 * @returns {{_t:Number}}
@@ -845,59 +913,66 @@
 	/**
 	 * @param inst
 	 * @param id
-	 * @private
-	 */
-	function ___DELETE_CACHE( inst, id ) {
-		const {cache: { info, list }} = _RAStorage.get(inst);
-		const index = list.findIndex((data)=>{ return data.id === id;});
-
-		if( index >= 0 ) {
-			const removed = list.splice( index, 1 ).pop();
-			info.total_size -= removed.size;
-		}
-	}
-
-	/**
-	 * @param inst
-	 * @param id
 	 * @returns {*}
 	 * @private
 	 */
-	function ___GET_CACHE( inst, id ) {
-		const {cache: { list }} = _RAStorage.get(inst);
-		const result = list.find((data)=>{ return data.id === id; });
-
-		if( result ) {
-			const value = result.value.slice(0);
-			return !inst._deserializer?value:inst._deserializer(value);
+	function ___GET_CACHE(inst, id) {
+		const {cache:{enabled, index, value}} = _RAStorage.get(inst);
+		if (!enabled) return undefined;
+		
+		
+		
+		const idx = index.indexOf(id);
+		if( idx >= 0 ) {
+			const val = value[idx].slice(0);
+			return !inst._deserializer?val:inst._deserializer(val);
 		}
 
 		return undefined;
 	}
+	/**
+	 * @param inst
+	 * @param id
+	 * @private
+	 */
+	function ___DELETE_CACHE(inst, id) {
+		const {cache} = _RAStorage.get(inst);
+		const {enabled, index, value} = cache;
+		if (!enabled) return;
 
+		const idx = index.indexOf(id);
+		if( idx >= 0 ) {
+			index.splice(idx, 1);
+			const val = value.splice(idx, 1);
+			cache.total_size -= val.byteLength;
+		}
+	}
 	/**
 	 * @param inst
 	 * @param id
 	 * @param value
 	 * @private
 	 */
-	function ___UPDATE_CACHE( inst, id, value ) {
-		const {cache: {info, list}} = _RAStorage.get(inst);
-		info.total_size = info.total_size | 0;
-
+	function ___UPDATE_CACHE(inst, id, value) {
+		const {cache} = _RAStorage.get(inst);
+		const {enabled, index, value:cached_val, max_data_size, max_total_size} = cache;
+		if (!enabled) return;
+		
+		
+		
 		___DELETE_CACHE( inst, id );
-
-		if( value.byteLength < CACHE_DATA_SIZE ) {
-			const size = value.byteLength;
-			list.push( { id, value: value.slice(0), size } );
-			info.total_size += size;
+		if ( value.byteLength <= max_data_size ) {
+			index.push(id);
+			cached_val.push(value);
+			cache.total_size += value.byteLength;
 		}
 
 
 		// NOTE: Remove old cache data
-		while( info.total_size > CACHE_TOTAL_SIZE ) {
-			const removed = list.shift();
-			info.total_size -= removed.size;
+		while( cache.total_size > max_total_size ) {
+			index.shift();
+			const val = cached_val.shift();
+			cache.total_size -= val.byteLength;
 		}
 	}
 	
@@ -937,9 +1012,10 @@
 	
 	/**
 	 * @class DataBlock
-	 * @property {Number} DataBlock.root
-	 * @property {Number} DataBlock.next
-	 * @property {Number} DataBlock.contentLength
+	 * @property {Boolean}	DataBlock.used
+	 * @property {Boolean}	DataBlock.root
+	 * @property {Number}	DataBlock.next
+	 * @property {Number}	DataBlock.contentLength
 	 * @property {Uint8Array|null} DataBlock.content
 	 * @private
 	**/
