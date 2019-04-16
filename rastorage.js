@@ -41,48 +41,40 @@
 	const DEFAULT_THROTTLE_BATCH_COUNT	= 100;
 	
 	
-
-
-
-
 	
-	/**
-	 * @type {WeakMap<RAStorage, RAStoragePrivates>}
-	 * @private
-	**/
-	const _RAStorage = new WeakMap();
+	
+	
+	
 	class RAStorage {
+		/**
+		 * @constructor
+		 * @param {Boolean} [err=true]
+		**/
 		constructor(err=true) {
 			if ( err ) {
 				throw new ReferenceError( "RAStorage instance should be obtained bia RAStorage.initAtPath method!" );
 			}
 			
-			/** @type {RAStoragePrivates} */
-			const PROPS = {
-				version: 0,
-				keep_alive: setInterval(()=>{}, 86400000),
-				throttle_queue: ThrottledQueue.CreateQueueWithConsumer(___THROTTLE_TIMEOUT.bind(null, this)),
-				segment_list: [],
-				root: null,
-				total_blocks: 0,
-				blst_fd: null,
-				segd_fd: null,
-				state: DB_STATE.CLOSED,
-				is_dirty: false,
-				
-				cache: {
-					enabled:true,
-					max_data_size:DEFAULT_MAX_CACHE_DATA_SIZE,
-					max_total_size:DEFAULT_MAX_CACHE_TOTAL_SIZE,
-					total_size:0,
-					index:[],
-					value:[]
-				},
-				throttle: {
-					batch_count:DEFAULT_THROTTLE_BATCH_COUNT
-				}
-			};
-			_RAStorage.set(this, PROPS);
+			
+			
+			this._keep_alive = setInterval(()=>{}, 86400000);
+			this._throttled_queue = ThrottledQueue.CreateQueueWithConsumer(___THROTTLE_TIMEOUT.bind(null, this));
+			this._version = 1;
+			this._segment_list = [];
+			this._root = null;
+			this._total_blocks = 0;
+			this._blst_fd = null;
+			this._segd_fd = null;
+			this._state = DB_STATE.CLOSED;
+			this._is_dirty = false;
+			this._throttle_batch_count = DEFAULT_THROTTLE_BATCH_COUNT;
+			
+			this._enabled = true;
+			this._max_data_size = DEFAULT_MAX_CACHE_DATA_SIZE;
+			this._max_total_size = DEFAULT_MAX_CACHE_TOTAL_SIZE;
+			this._total_size = 0;
+			this._index = [];
+			this._value = [];
 			
 			
 			this._serializer = null;
@@ -97,13 +89,11 @@
 		 * @returns {Promise<*>}
 		**/
 		get(id) {
-			const {throttle_queue, state} = _RAStorage.get(this);
-			
-			if ( state !== DB_STATE.OK ) {
+			if ( this._state !== DB_STATE.OK ) {
 				return Promise.reject(new Error("Database has been closed!"));
 			}
 			else {
-				return throttle_queue.push({op:THROTTLE_OP_TYPE.GET, id});
+				return this._throttled_queue.push({op:THROTTLE_OP_TYPE.GET, id});
 			}
 		}
 		
@@ -115,16 +105,14 @@
 		 * @returns {Promise<Number>}
 		**/
 		put(data) {
-			const {throttle_queue, state} = _RAStorage.get(this);
-		
-			if ( state !== DB_STATE.OK ) {
+			if ( this._state !== DB_STATE.OK ) {
 				return Promise.reject(new Error("Database has been closed!"));
 			}
 			else {
 				data = this._serializer ? this._serializer(data) : data;
 				data = ___OBTAIN_BUFFER(data);
 				
-				return throttle_queue.push({op:THROTTLE_OP_TYPE.PUT, data});
+				return this._throttled_queue.push({op:THROTTLE_OP_TYPE.PUT, data});
 			}
 		}
 		
@@ -138,16 +126,14 @@
 		 * @returns {Promise}
 		**/
 		set(id, data, force_create=false) {
-			const {throttle_queue, state} = _RAStorage.get(this);
-		
-			if ( state !== DB_STATE.OK ) {
+			if ( this._state !== DB_STATE.OK ) {
 				return Promise.reject(new Error("Database has been closed!"));
 			}
 			else {
 				data = this._serializer ? this._serializer(data) : data;
 				data = ___OBTAIN_BUFFER(data);
 				
-				return throttle_queue.push({op:THROTTLE_OP_TYPE.SET, id, data, force_create});
+				return this._throttled_queue.push({op:THROTTLE_OP_TYPE.SET, id, data, force_create});
 			}
 		}
 		
@@ -159,13 +145,11 @@
 		 * @returns {Promise}
 		**/
 		del(id) {
-			const {throttle_queue, state} = _RAStorage.get(this);
-			
-			if ( state !== DB_STATE.OK ) {
+			if ( this._state !== DB_STATE.OK ) {
 				return Promise.reject(new Error("Database has been closed!"));
 			}
 			else {
-				return throttle_queue.push({op:THROTTLE_OP_TYPE.DEL, id});
+				return this._throttled_queue.push({op:THROTTLE_OP_TYPE.DEL, id});
 			}
 		}
 		
@@ -176,11 +160,8 @@
 		 * @returns {Promise}
 		**/
 		close() {
-			const _PRIVATE = _RAStorage.get(this);
-			const {throttle_queue} = _PRIVATE;
-			
-			if ( _PRIVATE.state !== DB_STATE.OK ) {
-				if ( _PRIVATE.state === DB_STATE.CLOSING ) {
+			if ( this._state !== DB_STATE.OK ) {
+				if ( this._state === DB_STATE.CLOSING ) {
 					return Promise.reject(new Error( "Storage is closing now!" ));
 				}
 				else {
@@ -188,8 +169,8 @@
 				}
 			}
 			else {
-				_PRIVATE.state = DB_STATE.CLOSING;
-				return throttle_queue.push({op:THROTTLE_OP_TYPE.CLOSE});
+				this._state = DB_STATE.CLOSING;
+				return this._throttled_queue.push({op:THROTTLE_OP_TYPE.CLOSE});
 			}
 		}
 		
@@ -234,7 +215,7 @@
 			
 			
 			const SEGMENT_DESCRIPTOR_PATH = `${STORAGE_ROOT_PATH}/storage.segd`;
-			const STORAGE_DATA_CONTAINER = `${STORAGE_ROOT_PATH}/storage.blst`;
+			const STORAGE_DATA_CONTAINER  = `${STORAGE_ROOT_PATH}/storage.blst`;
 			// region [ Check & create storage content ]
 			// Init segment descriptor
 			item_stat = await fs.stat(SEGMENT_DESCRIPTOR_PATH).catch((e)=>{
@@ -270,19 +251,18 @@
 			// endregion
 			
 			
-			
+			/** @type {RAStorage} */
 			const STORAGE  = new RAStorage(false);
-			const _PRIVATE = _RAStorage.get(STORAGE);
 			const DataBuffer = Buffer.alloc(Math.max(BLST_HEADER_SIZE, SEGD_HEADER_SIZE, SEGD_ITEM_SIZE));
 			// region [ Load storage ]
-			_PRIVATE.root = STORAGE_ROOT_PATH;
-			const SEGD_FD = _PRIVATE.segd_fd = await fs.open(SEGMENT_DESCRIPTOR_PATH, 'r+');
-			const BLST_FD = _PRIVATE.blst_fd = await fs.open(STORAGE_DATA_CONTAINER,  'r+');
+			STORAGE._root = STORAGE_ROOT_PATH;
+			const SEGD_FD = STORAGE._segd_fd = await fs.open(SEGMENT_DESCRIPTOR_PATH, 'r+');
+			const BLST_FD = STORAGE._blst_fd = await fs.open(STORAGE_DATA_CONTAINER,  'r+');
 			
 			// Read content container's block sizes
 			await BLST_FD.read(DataBuffer, 0, BLST_HEADER_SIZE, 0);
-			_PRIVATE.version = DataBuffer.readUInt8(0);
-			_PRIVATE.total_blocks = DataBuffer.readUInt32LE(1);
+			STORAGE._version = DataBuffer.readUInt8(0);
+			STORAGE._total_blocks = DataBuffer.readUInt32LE(1);
 			
 			// Read segmentation descriptor size
 			await SEGD_FD.read(DataBuffer, 0, SEGD_HEADER_SIZE, 0);
@@ -293,15 +273,15 @@
 				segment_buffer.push(DataBuffer.readUInt32LE(0));
 				fPointer += SEGD_ITEM_SIZE;
 			}
-			_PRIVATE.segment_list = segment_buffer.sort(___SEGD_CMP);
+			STORAGE._segment_list = segment_buffer.sort(___SEGD_CMP);
 			// endregion
 			
 			
-			_PRIVATE.state = DB_STATE.OK;
-			_PRIVATE.cache.enabled = !!cache;
-			_PRIVATE.cache.max_data_size  = cache_max_data;
-			_PRIVATE.cache.max_total_size = cache_max >= cache_max_data ? cache_max : cache_max_data;
-			_PRIVATE.throttle.batch_count = throttle_batch_count > 0 ? throttle_batch_count : DEFAULT_THROTTLE_BATCH_COUNT;
+			STORAGE._state = DB_STATE.OK;
+			STORAGE._enabled = !!cache;
+			STORAGE._max_data_size  = cache_max_data;
+			STORAGE._max_total_size = cache_max >= cache_max_data ? cache_max : cache_max_data;
+			STORAGE._throttle_batch_count = throttle_batch_count > 0 ? throttle_batch_count : DEFAULT_THROTTLE_BATCH_COUNT;
 			return STORAGE;
 		}
 	}
@@ -344,7 +324,7 @@
 	 * @private
 	**/
 	async function ___THROTTLE_TIMEOUT(inst, queue) {
-		const {throttle:{batch_count:THROTTLE_BATCH_OP_COUNT}} = _RAStorage.get(inst);
+		const {_throttle_batch_count:THROTTLE_BATCH_OP_COUNT} = inst;
 	
 		if ( queue.length <= 0 ) return;
 		
@@ -431,10 +411,9 @@
 		const exec_results = await PromiseWaitAll(promises).catch(ret=>ret);
 		
 		// Update total blocks and other segment list...
-		const _PRIVATE = _RAStorage.get(inst);
-		if ( _PRIVATE.is_dirty ) {
+		if ( inst._is_dirty ) {
 			await ___DIRTY_WORK(inst);
-			_PRIVATE.is_dirty = false;
+			inst._is_dirty = false;
 		}
 		
 		for(let i=0; i<exec_results.length; i++) {
@@ -668,13 +647,11 @@
 	 * @private
 	**/
 	async function ___OPERATION_CLOSE(inst, operation) {
-		const _PRIVATE = _RAStorage.get(inst);
-		
 		try {
-			await PromiseWaitAll([_PRIVATE.blst_fd.close(), _PRIVATE.segd_fd.close()]);
-			clearInterval(_PRIVATE.keep_alive);
-			_PRIVATE.state = DB_STATE.CLOSED;
-			_PRIVATE.keep_alive = null;
+			await PromiseWaitAll([inst._blst_fd.close(), inst._segd_fd.close()]);
+			clearInterval(inst._keep_alive);
+			inst._state = DB_STATE.CLOSED;
+			inst._keep_alive = null;
 			return undefined;
 		}
 		catch(e) {
@@ -698,13 +675,10 @@
 	 * @private
 	**/
 	async function ___DIRTY_WORK(inst) {
-		const _PRIVATE = _RAStorage.get(inst);
-		const {segd_fd, blst_fd, total_blocks, segment_list} = _PRIVATE;
-		
 		// NOTE: Do truncate if necessary
-		if ( segment_list.length > 0 ) {
-			const list = segment_list.slice().sort(___SEGD_CMP);
-			if ( list[list.length-1] === total_blocks ) {
+		if ( inst._segment_list.length > 0 ) {
+			const list = inst._segment_list.slice().sort(___SEGD_CMP);
+			if ( list[list.length-1] === inst._total_blocks ) {
 				let last = list.pop();
 				let truncate_pos = [last];
 				while( list.length>0 && list[list.length-1]===(last-1) ) {
@@ -712,9 +686,9 @@
 				}
 				
 				if ( truncate_pos.length >= TRUNCATE_BOUNDARY ) {
-					await blst_fd.truncate(BLST_HEADER_SIZE + (truncate_pos[0]-1) * BLOCK_SIZE);
-					_PRIVATE.total_blocks -= truncate_pos.length;
-					segment_list.splice(0, segment_list.length, ...list);
+					await inst._blst_fd.truncate(BLST_HEADER_SIZE + (truncate_pos[0]-1) * BLOCK_SIZE);
+					inst._total_blocks -= truncate_pos.length;
+					inst._segment_list.splice(0, inst._segment_list.length, ...list);
 				}
 			}
 		}
@@ -725,20 +699,20 @@
 		
 		const blst_header = Buffer.alloc(BLST_HEADER_SIZE);
 		blst_header.writeUInt8(0x01, 0);
-		blst_header.writeUInt32LE(_PRIVATE.total_blocks, 1);
-		await blst_fd.write(blst_header, 0, BLST_HEADER_SIZE, 0);
+		blst_header.writeUInt32LE(inst._total_blocks, 1);
+		await inst._blst_fd.write(blst_header, 0, BLST_HEADER_SIZE, 0);
 		
 		
 		
 		
 		const segd_header = Buffer.alloc(SEGD_HEADER_SIZE);
-		segd_header.writeUInt32LE(segment_list.length, 0);
-		await segd_fd.write(segd_header, 0, SEGD_HEADER_SIZE, 0);
+		segd_header.writeUInt32LE(inst._segment_list.length, 0);
+		await inst._segd_fd.write(segd_header, 0, SEGD_HEADER_SIZE, 0);
 		
 		const segd_item = Buffer.alloc(SEGD_ITEM_SIZE);
-		for(let i=0; i<segment_list.length; i++) {
-			segd_item.writeUInt32LE(segment_list[i], 0);
-			await segd_fd.write(segd_item, 0, SEGD_ITEM_SIZE, SEGD_HEADER_SIZE + i*SEGD_ITEM_SIZE);
+		for(let i=0; i<inst._segment_list.length; i++) {
+			segd_item.writeUInt32LE(inst._segment_list[i], 0);
+			await inst._segd_fd.write(segd_item, 0, SEGD_ITEM_SIZE, SEGD_HEADER_SIZE + i*SEGD_ITEM_SIZE);
 		}
 	}
 	/**
@@ -749,18 +723,17 @@
 	 * @private
 	**/
 	async function ___READ_BLOCK(inst, blockId) {
-		const {total_blocks, blst_fd} = _RAStorage.get(inst);
 		if ( blockId <= 0 || blockId > MAX_BLOCK_RANGE ) {
 			throw new RangeError( `Requested block #${blockId} is out of range!` );
 		}
 		
 		// NOTE: Null means that the block space is not allocated yet!
-		if ( blockId > total_blocks ) { return null; }
+		if ( blockId > inst._total_blocks ) { return null; }
 		
 		
 		
 		let buff = Buffer.alloc(BLOCK_SIZE);
-		await blst_fd.read(buff, 0, BLOCK_SIZE, BLST_HEADER_SIZE + (blockId-1)*BLOCK_SIZE);
+		await inst._blst_fd.read(buff, 0, BLOCK_SIZE, BLST_HEADER_SIZE + (blockId-1)*BLOCK_SIZE);
 		
 		let
 		attr = buff[0],
@@ -784,7 +757,6 @@
 	 * @private
 	**/
 	async function ___WRITE_BLOCK(inst, blockId, content, next=0, attr={used:true, root:false}) {
-		const {blst_fd} = _RAStorage.get(inst);
 		if ( blockId <= 0 || blockId > MAX_BLOCK_RANGE ) {
 			throw new RangeError( `Requested block #${blockId} is out of range!` );
 		}
@@ -803,7 +775,7 @@
 		buff.writeUInt8(content.length, 5);
 		content.copy(buff, 6);
 		
-		await blst_fd.write(buff, 0, BLOCK_SIZE, BLST_HEADER_SIZE + (blockId-1)*BLOCK_SIZE);
+		await inst._blst_fd.write(buff, 0, BLOCK_SIZE, BLST_HEADER_SIZE + (blockId-1)*BLOCK_SIZE);
 	}
 	/**
 	 * @async
@@ -812,15 +784,13 @@
 	 * @private
 	**/
 	async function ___FREE_BLOCK(inst, blockId) {
-		const _PRIVATE = _RAStorage.get(inst);
-		const {blst_fd, segment_list, total_blocks} = _PRIVATE;
-		if ( blockId <= 0 || blockId > total_blocks ) {
+		if ( blockId <= 0 || blockId > inst._total_blocks ) {
 			throw new RangeError( `Requested block #${blockId} is out of range!` );
 		}
 		
-		await blst_fd.write(UNUSED_BLOCK, 0, BLOCK_SIZE, BLST_HEADER_SIZE + (blockId-1)*BLOCK_SIZE);
-		segment_list.push(blockId);
-		_PRIVATE.is_dirty = _PRIVATE.is_dirty || true;
+		await inst._blst_fd.write(UNUSED_BLOCK, 0, BLOCK_SIZE, BLST_HEADER_SIZE + (blockId-1)*BLOCK_SIZE);
+		inst._segment_list.push(blockId);
+		inst._is_dirty = inst._is_dirty || true;
 	}
 	/**
 	 * @param {RAStorage} inst
@@ -829,21 +799,18 @@
 	 * @private
 	**/
 	function ___ALLOCATE_BLOCKS(inst, num_blocks) {
-		const _PRIVATE = _RAStorage.get(inst);
-		const {segment_list} = _PRIVATE;
-		
-		let remaining_segments = segment_list.sort(___SEGD_CMP);
+		let remaining_segments = inst._segment_list.sort(___SEGD_CMP);
 		let selected = remaining_segments.splice(0, num_blocks);
-		_PRIVATE.segment_list = remaining_segments;
+		inst._segment_list = remaining_segments;
 		
 		
 		
 		let num_create = num_blocks - selected.length;
 		for(let i=0; i<num_create; i++) {
-			selected.push(++_PRIVATE.total_blocks);
+			selected.push(++inst._total_blocks);
 		}
 		if ( num_create > 0 ) {
-			_PRIVATE.is_dirty = _PRIVATE.is_dirty || true;
+			inst._is_dirty = inst._is_dirty || true;
 		}
 		
 		return selected;
@@ -854,18 +821,16 @@
 	 * @private
 	 */
 	function ___OCCUPY_BLOCK(inst, blockId) {
-		const _PRIVATE = _RAStorage.get(inst);
-		const {total_blocks, segment_list} = _PRIVATE;
-		if ( blockId <= total_blocks ) return;
+		if ( blockId <= inst._total_blocks ) return;
 		
-		_PRIVATE.total_blocks = blockId;
+		inst._total_blocks = blockId;
 		
 		// NOTE: Mark the blocks between old tail and latest block as unused
-		for( let i=total_blocks+1; i<blockId; i++ ) {
-			segment_list.push(i);
+		for( let i=inst._total_blocks+1; i<blockId; i++ ) {
+			inst._segment_list.push(i);
 		}
 		
-		_PRIVATE.is_dirty = _PRIVATE.is_dirty || true;
+		inst._is_dirty = inst._is_dirty || true;
 	}
 	/**
 	 * @param {Map<String, {_t:Number}>} locker
@@ -884,68 +849,63 @@
 	}
 
 	/**
-	 * @param inst
+	 * @param {RAStorage} inst
 	 * @param id
 	 * @returns {*}
 	 * @private
 	 */
 	function ___GET_CACHE(inst, id) {
-		const {cache:{enabled, index, value}} = _RAStorage.get(inst);
-		if (!enabled) return undefined;
+		if (!inst._enabled) return undefined;
 		
 		
 		
-		const idx = index.indexOf(id);
+		const idx = inst._index.indexOf(id);
 		if( idx >= 0 ) {
-			const val = value[idx].slice(0);
+			const val = inst._value[idx].slice(0);
 			return !inst._deserializer?val:inst._deserializer(val);
 		}
 
 		return undefined;
 	}
 	/**
-	 * @param inst
+	 * @param {RAStorage} inst
 	 * @param id
 	 * @private
 	 */
 	function ___DELETE_CACHE(inst, id) {
-		const {cache} = _RAStorage.get(inst);
-		const {enabled, index, value} = cache;
-		if (!enabled) return;
+		if (!inst._enabled) return;
 
-		const idx = index.indexOf(id);
+		const idx = inst._index.indexOf(id);
 		if( idx >= 0 ) {
-			index.splice(idx, 1);
-			const val = value.splice(idx, 1);
-			cache.total_size -= val.byteLength;
+			inst._index.splice(idx, 1);
+			const val = inst._value.splice(idx, 1);
+			inst._total_size -= val.byteLength;
 		}
 	}
 	/**
-	 * @param inst
+	 * @param {RAStorage} inst
 	 * @param id
 	 * @param value
 	 * @private
 	 */
 	function ___UPDATE_CACHE(inst, id, value) {
-		const {cache} = _RAStorage.get(inst);
-		const {enabled, index, value:cached_val, max_data_size, max_total_size} = cache;
-		if (!enabled) return;
+		if (!inst._enabled) return;
 		
 		
 		
 		___DELETE_CACHE( inst, id );
-		if ( value.byteLength <= max_data_size ) {
-			index.push(id);
-			cached_val.push(value);
-			cache.total_size += value.byteLength;
+		if ( value.byteLength <= inst._max_data_size ) {
+			inst._index.push(id);
+			inst._value.push(value);
+			inst._total_size += value.byteLength;
 		}
 
 
 		// NOTE: Remove old cache data
-		while( cache.total_size > max_total_size ) {
-			index.shift();
-			const val = cached_val.shift();
-			cache.total_size -= val.byteLength;
+		while( inst._total_size > inst._max_total_size ) {
+			inst._index.shift();
+			const val = inst._value.shift();
+			inst._total_size -= val.byteLength;
 		}
 	}
 	
