@@ -52,7 +52,7 @@
 		**/
 		constructor(err=true) {
 			if ( err ) {
-				throw new ReferenceError( "RAStorage instance should be obtained bia RAStorage.initAtPath method!" );
+				throw new ReferenceError( "RAStorage instance should be obtained via RAStorage.initAtPath method!" );
 			}
 			
 			
